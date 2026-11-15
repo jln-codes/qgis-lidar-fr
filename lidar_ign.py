@@ -17,12 +17,18 @@ from urllib.error import HTTPError, URLError
 
 from osgeo import gdal
 from qgis.core import (
+    Qgis,
+    QgsColorRampShader,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsGeometry,
     QgsProject,
     QgsRasterLayer,
+    QgsRasterMinMaxOrigin,
+    QgsRasterShader,
     QgsRectangle,
+    QgsSingleBandPseudoColorRenderer,
+    QgsStyle,
     QgsWkbTypes,
 )
 
@@ -176,6 +182,35 @@ def download_block(xmin, ymin, dest):
         time.sleep(delay)
 
 
+def create_altitude_renderer(raster):
+    """Rendu natif Turbo, reclassé par QGIS sur chaque nouvelle vue."""
+    ramp = QgsStyle.defaultStyle().colorRamp("Turbo")
+    if ramp is None:
+        raise RuntimeError("Palette Turbo introuvable dans le style par défaut QGIS.")
+
+    # Bornes provisoires uniquement : aucune lecture des pixels ici. Au premier
+    # rendu, UpdatedCanvas calcule les min/max estimés de la vue et reclasse la
+    # rampe. Ne pas appeler bandStatistics(1) : sampleSize=0 lirait tout le VRT.
+    color_shader = QgsColorRampShader(
+        0.0, 1.0, ramp,
+        Qgis.ShaderInterpolationMethod.Linear,
+        Qgis.ShaderClassificationMethod.Continuous,
+    )
+    color_shader.classifyColorRamp()
+    shader = QgsRasterShader(0.0, 1.0)
+    shader.setRasterShaderFunction(color_shader)
+    renderer = QgsSingleBandPseudoColorRenderer(raster.dataProvider(), 1, shader)
+    renderer.setClassificationMin(0.0)
+    renderer.setClassificationMax(1.0)
+
+    origin = QgsRasterMinMaxOrigin()
+    origin.setLimits(Qgis.RasterRangeLimit.MinimumMaximum)
+    origin.setExtent(Qgis.RasterRangeExtent.UpdatedCanvas)
+    origin.setStatAccuracy(Qgis.RasterRangeAccuracy.Estimated)
+    renderer.setMinMaxOrigin(origin)
+    return renderer
+
+
 def main():
     layer = find_emprise_layer()
     print(f"Couche : {layer.name()} | SCR : {layer.crs().authid()}")
@@ -287,6 +322,7 @@ def main():
     raster = QgsRasterLayer(str(vrt_path), OUTPUT_LAYER_NAME, "gdal")
     if not raster.isValid():
         raise RuntimeError("VRT créé, mais impossible de l'ajouter à QGIS.")
+    raster.setRenderer(create_altitude_renderer(raster))
     project.addMapLayer(raster)
     iface.setActiveLayer(raster)
     iface.zoomToActiveLayer()
