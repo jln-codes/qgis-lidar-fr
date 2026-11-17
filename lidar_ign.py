@@ -8,6 +8,7 @@ sur disque et sont réutilisables entre sessions QGIS.
 """
 
 import hashlib
+import traceback
 import math
 import time
 from pathlib import Path
@@ -18,6 +19,8 @@ from urllib.error import HTTPError, URLError
 from osgeo import gdal
 from qgis.core import (
     Qgis,
+    QgsApplication,
+    QgsTask,
     QgsColorRampShader,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
@@ -47,6 +50,7 @@ WMS_URL = "https://data.geopf.fr/wms-r/wms"
 WMS_LAYER = "IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93"
 OUTPUT_LAYER_NAME = "MNT LiDAR HD IGN — emprise (VRT)"
 VRT_PREFIX = "mnt_lidar_ign_emprise_v03_"
+TASK_DESCRIPTION = "IGN LiDAR HD — téléchargement des blocs"
 # -----------------------------------------------------------------------
 
 
@@ -131,7 +135,20 @@ def check_geotiff(path):
     return ok
 
 
-def download_block(xmin, ymin, dest):
+class DownloadCancelled(Exception):
+    """Annulation volontaire, distincte d'une erreur du serveur."""
+
+
+def interruptible_pause(seconds, is_canceled):
+    """Attend sans bloquer l'interface et permet d'annuler les délais."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if is_canceled():
+            raise DownloadCancelled()
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+
+def download_block(xmin, ymin, dest, is_canceled):
     params = {
         "SERVICE": "WMS",
         "VERSION": "1.3.0",
@@ -148,16 +165,22 @@ def download_block(xmin, ymin, dest):
     url = WMS_URL + "?" + urlencode(params)
     request = Request(url, headers={"User-Agent": "QGIS-LiDAR-IGN-prototype/0.1"})
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        if is_canceled():
+            raise DownloadCancelled()
         try:
             with urlopen(request, timeout=90) as response:
                 payload = response.read()
             if payload[:4] not in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
                 excerpt = payload[:500].decode("utf-8", errors="replace")
                 raise RuntimeError(f"Réponse IGN non TIFF : {excerpt}")
+            if is_canceled():
+                raise DownloadCancelled()
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_suffix(".part")
             try:
                 tmp.write_bytes(payload)
+                if is_canceled():
+                    raise DownloadCancelled()
                 if not check_geotiff(tmp):
                     raise RuntimeError(f"GeoTIFF invalide ou non Float32 : {xmin},{ymin}")
                 tmp.replace(dest)
@@ -179,7 +202,7 @@ def download_block(xmin, ymin, dest):
         delay = RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
         print(f"    Échec tentative {attempt}/{MAX_ATTEMPTS} ({message}) ; "
               f"nouvel essai dans {delay:.0f} s")
-        time.sleep(delay)
+        interruptible_pause(delay, is_canceled)
 
 
 def create_altitude_renderer(raster):
@@ -204,49 +227,24 @@ def create_altitude_renderer(raster):
     renderer.setClassificationMax(1.0)
 
     origin = QgsRasterMinMaxOrigin()
-    origin.setLimits(Qgis.RasterRangeLimit.MinimumMaximum)
-    origin.setExtent(Qgis.RasterRangeExtent.UpdatedCanvas)
-    origin.setStatAccuracy(Qgis.RasterRangeAccuracy.Estimated)
+    # QGIS 3.42 moved these enums from QgsRasterMinMaxOrigin to Qgis.
+    # Keep the same native settings on QGIS 3.40 LTR and QGIS 3.44 LTR.
+    if hasattr(Qgis, "RasterRangeLimit"):
+        origin.setLimits(Qgis.RasterRangeLimit.MinimumMaximum)
+        origin.setExtent(Qgis.RasterRangeExtent.UpdatedCanvas)
+        origin.setStatAccuracy(Qgis.RasterRangeAccuracy.Estimated)
+    else:
+        origin.setLimits(QgsRasterMinMaxOrigin.MinMax)
+        origin.setExtent(QgsRasterMinMaxOrigin.UpdatedCanvas)
+        origin.setStatAccuracy(QgsRasterMinMaxOrigin.Estimated)
     renderer.setMinMaxOrigin(origin)
     return renderer
 
 
-def main():
-    layer = find_emprise_layer()
-    print(f"Couche : {layer.name()} | SCR : {layer.crs().authid()}")
-    polygons = get_polygons_l93(layer)
-    blocks = grid_blocks_intersecting(polygons)
-    if not blocks:
-        raise RuntimeError("Aucun bloc ne croise les polygones.")
-
+def build_and_show_vrt(blocks, transferred, failed, elapsed_download):
+    """Appel uniquement depuis le thread principal QGIS, après la tâche réseau."""
+    started = time.monotonic()
     paths = [output_path(x, y) for x, y in blocks]
-    missing = [(xy, path) for xy, path in zip(blocks, paths)
-               if not check_geotiff(path)]
-
-    print(f"Blocs intersectés : {len(blocks)}")
-    print(f"En cache : {len(blocks) - len(missing)} | À télécharger : {len(missing)}")
-    print(f"Volume brut théorique si tous téléchargés : "
-          f"{len(blocks) * PIXELS * PIXELS * 4 / 1024**2:.1f} Mio")
-
-    if len(missing) > MAX_NEW_BLOCKS:
-        raise RuntimeError(
-            f"Sécurité : {len(missing)} blocs à télécharger "
-            f"(limite MAX_NEW_BLOCKS={MAX_NEW_BLOCKS}). "
-            "Réduis l'emprise ou ajuste volontairement cette limite."
-        )
-
-    transferred = 0
-    failed = []
-    for index, ((xmin, ymin), path) in enumerate(missing, start=1):
-        try:
-            size = download_block(xmin, ymin, path)
-            transferred += size
-            print(f"  [{index}/{len(missing)}] {xmin},{ymin} — {size / 1024**2:.2f} Mio")
-        except RuntimeError as err:
-            failed.append((xmin, ymin, str(err)))
-            print(f"  [{index}/{len(missing)}] ÉCHEC — {err}")
-        time.sleep(REQUEST_PAUSE_SECONDS)
-
     available_paths = [path for path in paths if check_geotiff(path)]
     if not available_paths:
         raise RuntimeError("Aucun GeoTIFF valide à assembler.")
@@ -308,6 +306,13 @@ def main():
             "Aucune nouvelle couche ajoutée."
         )
 
+    # Préparer et valider la nouvelle couche AVANT d'enlever l'ancienne.
+    # Ainsi, une erreur de symbologie ne vide pas le canevas QGIS.
+    raster = QgsRasterLayer(str(vrt_path), OUTPUT_LAYER_NAME, "gdal")
+    if not raster.isValid():
+        raise RuntimeError("VRT créé, mais impossible de l'ajouter à QGIS.")
+    raster.setRenderer(create_altitude_renderer(raster))
+
     project = QgsProject.instance()
     # Nettoyer les anciennes couches du prototype, SANS supprimer les GeoTIFF
     # ni les fichiers VRT : un projet QGIS sauvegardé pourrait y faire référence.
@@ -319,10 +324,6 @@ def main():
                 and Path(old.source()).parent == CACHE_DIR):
             project.removeMapLayer(old.id())
 
-    raster = QgsRasterLayer(str(vrt_path), OUTPUT_LAYER_NAME, "gdal")
-    if not raster.isValid():
-        raise RuntimeError("VRT créé, mais impossible de l'ajouter à QGIS.")
-    raster.setRenderer(create_altitude_renderer(raster))
     project.addMapLayer(raster)
     iface.setActiveLayer(raster)
     iface.zoomToActiveLayer()
@@ -336,6 +337,128 @@ def main():
     print(f"Blocs disponibles : {len(available_paths)}/{len(paths)}")
     print("Note : les blocs sont rectangulaires ; leurs pixels hors polygone "
           "ne sont pas masqués dans le VRT.")
+    print(f"Temps tâche téléchargement : {elapsed_download:.2f} s")
+    print(f"Temps assemblage et affichage : {time.monotonic() - started:.2f} s")
+
+
+class LidarDownloadTask(QgsTask):
+    """Opérations réseau et fichiers seulement ; ne touche jamais au projet QGIS."""
+
+    def __init__(self, blocks, missing, cached):
+        super().__init__(
+            f"{TASK_DESCRIPTION} ({cached} en cache, {len(missing)} à télécharger)",
+            QgsTask.CanCancel,
+        )
+        # Instantané sans QgsGeometry, QgsMapLayer, QgsProject ou widgets.
+        self.blocks = list(blocks)
+        self.missing = list(missing)
+        self.cached = cached
+        self.transferred = 0
+        self.failed = []
+        self.error = None
+        self.elapsed_download = 0.0
+
+    def run(self):
+        started = time.monotonic()
+        try:
+            total = len(self.blocks)
+            processed = self.cached
+            self.setProgress(100.0 * processed / total)
+            for index, ((xmin, ymin), path) in enumerate(self.missing, start=1):
+                if self.isCanceled():
+                    return False
+                try:
+                    size = download_block(xmin, ymin, path, self.isCanceled)
+                    self.transferred += size
+                except DownloadCancelled:
+                    return False
+                except Exception as err:
+                    # Conserver le comportement V0.3 : rapporter les échecs
+                    # et afficher un VRT éventuellement incomplet à la fin.
+                    self.failed.append((xmin, ymin, str(err)))
+                processed += 1
+                self.setProgress(100.0 * processed / total)
+                if index < len(self.missing):
+                    interruptible_pause(REQUEST_PAUSE_SECONDS, self.isCanceled)
+            return not self.isCanceled()
+        except DownloadCancelled:
+            return False
+        except Exception:
+            self.error = traceback.format_exc()
+            return False
+        finally:
+            self.elapsed_download = time.monotonic() - started
+
+    def finished(self, success):
+        """QgsTaskManager appelle cette méthode sur le thread principal."""
+        try:
+            if self.isCanceled():
+                print("LiDAR IGN : téléchargement annulé. Tuiles déjà validées conservées.")
+                iface.messageBar().pushMessage(
+                    "LiDAR IGN", "Annulé ; les tuiles reçues restent en cache.",
+                    level=Qgis.Warning, duration=6,
+                )
+                return
+            if not success:
+                print("LiDAR IGN : erreur de tâche :", self.error)
+                iface.messageBar().pushMessage(
+                    "LiDAR IGN", "Erreur dans la tâche ; consulter la console Python.",
+                    level=Qgis.Critical, duration=10,
+                )
+                return
+            build_and_show_vrt(
+                self.blocks, self.transferred, self.failed, self.elapsed_download
+            )
+            count = len(self.failed)
+            iface.messageBar().pushMessage(
+                "LiDAR IGN",
+                (f"VRT affiché : {len(self.blocks) - count}/{len(self.blocks)} "
+                 f"blocs, {self.transferred / 1024**2:.1f} Mio transférés"),
+                level=Qgis.Warning if count else Qgis.Success,
+                duration=10,
+            )
+        except Exception:
+            print("LiDAR IGN : échec d'assemblage/affichage :", traceback.format_exc())
+            iface.messageBar().pushMessage(
+                "LiDAR IGN", "Erreur VRT/rendu ; consulter la console Python.",
+                level=Qgis.Critical, duration=10,
+            )
+
+
+def main():
+    # Évite deux téléchargements simultanés de la même tuile et du même .part.
+    if any(task.description().startswith(TASK_DESCRIPTION)
+           for task in QgsApplication.taskManager().activeTasks()):
+        print("LiDAR IGN : une tâche est déjà active. Attendre ou l'annuler.")
+        return
+
+    layer = find_emprise_layer()
+    print(f"Couche : {layer.name()} | SCR : {layer.crs().authid()}")
+    polygons = get_polygons_l93(layer)
+    blocks = grid_blocks_intersecting(polygons)
+    if not blocks:
+        raise RuntimeError("Aucun bloc ne croise les polygones.")
+    paths = [output_path(x, y) for x, y in blocks]
+    missing = [(xy, path) for xy, path in zip(blocks, paths)
+               if not check_geotiff(path)]
+    cached = len(blocks) - len(missing)
+
+    print(f"Blocs intersectés : {len(blocks)}")
+    print(f"En cache : {cached} | À télécharger : {len(missing)}")
+    print(f"Volume brut théorique si tous téléchargés : "
+          f"{len(blocks) * PIXELS * PIXELS * 4 / 1024**2:.1f} Mio")
+    if len(missing) > MAX_NEW_BLOCKS:
+        raise RuntimeError(
+            f"Sécurité : {len(missing)} blocs à télécharger "
+            f"(limite MAX_NEW_BLOCKS={MAX_NEW_BLOCKS}). "
+            "Réduis l'emprise ou ajuste volontairement cette limite."
+        )
+
+    task = LidarDownloadTask(blocks, missing, cached)
+    QgsApplication.taskManager().addTask(task)
+    print("Tâche démarrée dans le gestionnaire QGIS :", task.description())
+    print("La progression et le bouton Annuler sont accessibles dans les tâches QGIS.")
+    print("Le VRT ne sera ajouté qu'une fois la tâche terminée.")
 
 
 main()
