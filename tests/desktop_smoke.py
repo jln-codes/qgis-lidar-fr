@@ -94,7 +94,7 @@ def start():
     for name, folder in (("lidar_hd_2026", "LiDAR"), ("sig_prestations", "plugin")):
         metadata = configparser.ConfigParser(interpolation=None)
         metadata.read(ROOT / folder / name / "metadata.txt", encoding="utf-8")
-        archives.append(ROOT / f"dist/{name}-{metadata['general']['version']}.zip")
+        archives.append(ROOT / f"plugin/dist/{name}-{metadata['general']['version']}.zip")
     for archive in archives:
         with ZipFile(archive) as z:
             z.extractall(installed)

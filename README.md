@@ -9,7 +9,7 @@ ni importé ni inclus dans le ZIP.
 ## Installation et utilisation
 
 1. Dans QGIS, ouvrir **Extensions → Installer/Gérer les extensions → Installer
-   depuis un ZIP** et choisir `dist/lidar_hd_2026-0.1.0.zip` à la racine du dépôt.
+   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.0.zip` dans le dépôt.
 2. Activer **LiDAR HD 2026**. Son unique bouton se trouve dans **SIG-Milieux**,
    également accessible par **Extensions → SIG-Milieux**. Si nécessaire, afficher
    cette barre via **Vue → Barres d'outils**.
@@ -90,7 +90,7 @@ de renommage devront être validées sur le véritable partage SMB et sous Windo
 Les deux plugins recherchent la même barre Qt `SIGMilieuxToolbar`, titrée
 **SIG-Milieux**, sans importer le code de l'autre. Chaque plugin retire seulement
 ses propres actions ; le dernier retire la barre vide. Le ZIP SIG-Prestations
-reconstruit avec cette adaptation graphique est aussi disponible sous `dist/`.
+reconstruit avec cette adaptation graphique est aussi disponible sous `plugin/dist/`.
 Son icône et ses fonctionnalités métier ne changent pas.
 
 L'icône LiDAR reprend la référence fournie
@@ -107,9 +107,12 @@ visuel, sans entrer dans le ZIP.
 
 Depuis la racine du dépôt :
 
+Les ZIP sont des sorties locales générées dans `plugin/dist/` et ignorées par
+Git. Les commandes ci-dessous permettent de les reconstruire après un clone.
+
 ```sh
 python3 LiDAR/build_plugin.py
-# Construire aussi le ZIP SIG-Prestations courant dans dist/ :
+# Construire aussi le ZIP SIG-Prestations courant dans plugin/dist/ :
 python3 LiDAR/build_plugin.py --with-sig
 # Régénérer PNG et aperçus avec le Python fourni avec QGIS :
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/build_plugin.py --icons
@@ -131,7 +134,7 @@ horodatages ZIP sont fixes pour rendre l'archive reproductible.
 `tests/desktop_smoke.py` est une recette automatisée distincte, lancée dans
 **QGIS Desktop réel**, avec les ZIP extraits dans un profil de test, des clics Qt
 et des GeoTIFF fictifs. Sous Linux, après avoir construit les deux ZIP dans
-`dist/`, on peut la lancer dans un affichage virtuel :
+`plugin/dist/`, on peut la lancer dans un affichage virtuel :
 
 ```sh
 LIDAR_PROJECT_ROOT="$PWD" QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=none \

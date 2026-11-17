@@ -14,7 +14,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "LiDAR/lidar_hd_2026"
-DIST = ROOT / "dist"
+DIST = ROOT / "plugin" / "dist"
 FILES = {"__init__.py", "metadata.txt", "plugin.py", "config.py", "dialog.py",
          "engine.py", "spatial.py", "selection.py", "rendering.py",
          "icons/lidar_hd.svg", "icons/lidar_hd.png"}
@@ -88,11 +88,10 @@ def build(dist=None):
 
 
 def build_sig():
-    """Réutiliser le constructeur existant ; seuls les ZIP vont dans dist/."""
+    """Réutiliser le constructeur existant et sa destination plugin/dist/."""
     spec = importlib.util.spec_from_file_location("sig_builder", ROOT / "plugin/tools/build_plugin.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
-    builder.DIST_DIR = DIST
     output = builder.write_archive(builder.validate_plugin())
     builder.validate_archive(output)
     return output
@@ -101,7 +100,7 @@ def build_sig():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--icons", action="store_true", help="Régénérer PNG et aperçus avec Qt SVG")
-    parser.add_argument("--with-sig", action="store_true", help="Construire aussi le ZIP SIG-Prestations dans dist/")
+    parser.add_argument("--with-sig", action="store_true", help="Construire aussi le ZIP SIG-Prestations dans plugin/dist/")
     args = parser.parse_args()
     if args.icons:
         export_icons()

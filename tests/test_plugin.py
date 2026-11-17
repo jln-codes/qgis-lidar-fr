@@ -617,6 +617,7 @@ task.finished(success)
     def test_package_reproducible_matches_sources_and_installed_import(self):
         spec=importlib.util.spec_from_file_location("lidar_builder",ROOT/"LiDAR/build_plugin.py")
         builder=importlib.util.module_from_spec(spec); spec.loader.exec_module(builder)
+        self.assertEqual(builder.DIST,ROOT/"plugin/dist")
         archive=builder.build(self.work)
         content=archive.read_bytes(); self.assertEqual(content,builder.build(self.work).read_bytes())
         with ZipFile(archive) as z:
