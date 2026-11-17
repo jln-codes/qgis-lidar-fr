@@ -1,4 +1,4 @@
-# LiDAR HD 2026 — plugin QGIS 0.1.0
+# LiDAR HD 2026 — plugin QGIS 0.1.1
 
 Extension autonome pour extraire le MNT LiDAR HD IGN à partir de polygones.
 Aucune installation de Python ou de bibliothèque supplémentaire n'est nécessaire
@@ -9,7 +9,7 @@ ni importé ni inclus dans le ZIP.
 ## Installation et utilisation
 
 1. Dans QGIS, ouvrir **Extensions → Installer/Gérer les extensions → Installer
-   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.0.zip` dans le dépôt.
+   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.1.zip` dans le dépôt.
 2. Activer **LiDAR HD 2026**. Son unique bouton se trouve dans **SIG-Milieux**,
    également accessible par **Extensions → SIG-Milieux**. Si nécessaire, afficher
    cette barre via **Vue → Barres d'outils**.
@@ -38,6 +38,17 @@ ni importé ni inclus dans le ZIP.
    linéaire, min/max estimés sur la vue actualisée (**Updated Canvas**). Si la
    symbologie échoue, le raster demeure chargé avec son rendu par défaut et
    l'erreur est affichée.
+
+Après une mise à jour, redémarrer QGIS et vérifier la version et le chemin
+chargés dans le journal **LiDAR HD 2026**. Pour la barre commune avec
+SIG-Prestations, installer également son ZIP courant : les anciennes versions
+utilisant la barre générale des extensions ne rejoignent pas cette barre.
+La barre **SIG-Milieux** est affichée à l'activation, avec une icône par plugin ;
+son entrée de menu conserve son libellé.
+
+Les paramètres sont disposés dans les deux colonnes **Emprise** et **Fichiers**.
+Les infobulles expliquent les options. Sur un écran réduit ou à forte échelle,
+le contenu peut défiler ; les commandes et la progression restent accessibles.
 
 En cas d'échecs de blocs, un MNT **INCOMPLET** peut être ajouté. Le message indique
 les blocs manquants ; relancer avec un autre nom pour compléter depuis le cache.
@@ -139,14 +150,18 @@ et des GeoTIFF fictifs. Sous Linux, après avoir construit les deux ZIP dans
 ```sh
 LIDAR_PROJECT_ROOT="$PWD" QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=none \
 QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a qgis \
-  --nologo --noversioncheck --noplugins \
+  --nologo --noversioncheck \
   --profiles-path "$PWD/audits/lidar-desktop/profiles" --profile lidar-smoke \
   --code "$PWD/LiDAR/tests/desktop_smoke.py"
 ```
 
-Cette recette est distincte d'une recette humaine. Son résultat est écrit dans
+Cette recette utilise un profil isolé, sans extensions utilisateur ; conserver
+l'extension intégrée **Processing** active, nécessaire à l'exécution de `--code`.
+Elle est distincte d'une recette humaine. Son résultat est écrit dans
 `audits/lidar-desktop/result.json`. Les tests avec des façades d'énumérations
 3.34 et 3.40 sont **simulés**, pas des exécutions sur ces versions. Consulter
-`audits/LIDAR-PLUGIN-01.md` pour les résultats effectifs, les limites et
-l'inventaire des API. La validation Windows et les recettes réelles sur 3.34 et
-3.40 restent obligatoires avant d'annoncer une diffusion générale compatible.
+`audits/LIDAR-PLUGIN-02.md` pour les résultats effectifs de la correction IGN,
+de la barre et du dialogue ; `audits/LIDAR-PLUGIN-01.md` décrit
+l'inventaire des API. La validation Windows et les recettes interactives dans
+QGIS Desktop 3.34/3.40 restent à réaliser ; les tests PyQGIS hors écran ont été
+exécutés réellement sur ces versions sous Linux.

@@ -42,35 +42,91 @@ def tile_path(root, xy):
     return Path(root) / "tiles" / f"mnt_l93_{xy[0]}_{xy[1]}_{config.BLOCK_M}m_{config.PIXELS}px.tif"
 
 
-def check_geotiff(path, xy=None):
-    """Valider les données, le SCR, le NoData et la grille, sans réseau."""
-    if not Path(path).is_file():
+def is_lambert93(srs):
+    """SCR officiel, ou WKT IGN incomplet précisément identifié par l'audit.
+
+    L'IGN nomme ce PROJCS EPSG:2154 mais perd son GEOGCS dans le GeoTIFF.
+    Ne remplacer le GEOGCS qu'en mémoire, pour cette signature connue, puis
+    comparer encore TOUS les paramètres projetés au SCR officiel.
+    """
+    expected = osr.SpatialReference()
+    expected.ImportFromEPSG(2154)
+    if srs.IsSame(expected):
+        return True
+    if not (srs.GetAttrValue("PROJCS") == "EPSG:2154"
+            and srs.GetAttrValue("GEOGCS") == "unknown"
+            and srs.GetAttrValue("DATUM") == "unnamed"
+            and srs.GetAttrValue("SPHEROID") == "unretrievable - using WGS84"
+            and math.isclose(srs.GetSemiMajor(), 6378137, rel_tol=0, abs_tol=1e-6)
+            and math.isclose(srs.GetInvFlattening(), 298.257223563, rel_tol=0, abs_tol=1e-9)
+            and math.isclose(float(srs.GetAttrValue("PRIMEM", 1) or "nan"), 0, rel_tol=0, abs_tol=1e-12)
+            and math.isclose(srs.GetAngularUnits(), math.pi / 180, rel_tol=0, abs_tol=1e-15)):
         return False
+    comparison = srs.Clone()
+    comparison.CopyGeogCSFrom(expected)
+    return bool(comparison.IsSame(expected))
+
+
+def geotiff_error(path, xy=None):
+    """None si valide ; sinon le contrôle précis en échec, sans réseau."""
+    path = Path(path)
+    if not path.is_file():
+        return f"GeoTIFF absent : {path.name}"
     gdal.PushErrorHandler("CPLQuietErrorHandler")
+    ds = None
     try:
+        with path.open("rb") as stream:
+            header = stream.read(512)
+        if header[:4] not in (b"II*\x00", b"MM\x00*", b"II+\x00", b"MM\x00+"):
+            excerpt = " ".join(header.decode("utf-8", errors="replace").split())[:240]
+            return f"Format inattendu (non TIFF), signature {header[:8].hex()} : {excerpt}"
         ds = gdal.Open(str(path), gdal.GA_ReadOnly)
-        if ds is None or ds.RasterCount != 1:
-            return False
+        if ds is None:
+            return "GeoTIFF illisible par GDAL"
+        if ds.GetDriver().ShortName != "GTiff":
+            return f"Format inattendu : pilote {ds.GetDriver().ShortName}, attendu GTiff"
+        if (ds.RasterXSize, ds.RasterYSize) != (config.PIXELS, config.PIXELS):
+            return f"Dimensions incorrectes : {ds.RasterXSize} × {ds.RasterYSize}, attendu {config.PIXELS} × {config.PIXELS}"
+        if ds.RasterCount != 1:
+            return f"Nombre de bandes incorrect : {ds.RasterCount}, attendu 1"
         band = ds.GetRasterBand(1)
-        gt = ds.GetGeoTransform()
-        expected = osr.SpatialReference()
-        expected.ImportFromEPSG(2154)
+        if band.DataType != gdal.GDT_Float32:
+            return f"Type incorrect : {gdal.GetDataTypeName(band.DataType)}, attendu Float32"
+        if band.GetNoDataValue() != config.NODATA:
+            return f"NoData incorrect : {band.GetNoDataValue()!r}, attendu {config.NODATA}"
         actual = osr.SpatialReference()
-        actual.ImportFromWkt(ds.GetProjection())
-        valid = (ds.GetDriver().ShortName == "GTiff"
-                 and ds.RasterXSize == config.PIXELS and ds.RasterYSize == config.PIXELS
-                 and band.DataType == gdal.GDT_Float32 and band.GetNoDataValue() == config.NODATA
-                 and bool(actual.IsSame(expected))
-                 and all(abs(a - b) < 1e-6 for a, b in zip(gt[1:3] + gt[4:], (0.5, 0, 0, -0.5))))
-        if xy is not None:
-            valid = valid and abs(gt[0] - xy[0]) < 1e-6 and abs(gt[3] - xy[1] - config.BLOCK_M) < 1e-6
+        wkt = ds.GetProjection()
+        if not wkt:
+            return "SCR absent : EPSG:2154 requis"
+        try:
+            if actual.ImportFromWkt(wkt) != 0 or not is_lambert93(actual):
+                return (f"SCR incorrect : nom {actual.GetName() or 'inconnu'}, "
+                        f"datum {actual.GetAttrValue('DATUM') or 'absent'} ; "
+                        "description non équivalente au Lambert-93 EPSG:2154")
+        except (RuntimeError, ValueError):
+            return "SCR illisible : EPSG:2154 requis"
+        gt = ds.GetGeoTransform()
+        if not all(math.isfinite(value) for value in gt):
+            return "Grille incorrecte : géotransformation non finie"
+        if not all(abs(a - b) < 1e-6 for a, b in zip(gt[1:3] + gt[4:], (0.5, 0, 0, -0.5))):
+            return f"Grille incorrecte : résolution 0,5 m sans rotation requise, reçu {gt}"
+        if xy is not None and not (abs(gt[0] - xy[0]) < 1e-6 and abs(gt[3] - xy[1] - config.BLOCK_M) < 1e-6):
+            return f"Emprise incorrecte : origine {gt[0]},{gt[3]}, bloc attendu {xy[0]},{xy[1]}"
         # Lire tous les pixels détecte aussi les bandes TIFF tronquées.
-        return valid and len(band.ReadRaster() or b"") == config.PIXELS ** 2 * 4
-    except (RuntimeError, ValueError, OSError):
-        return False
+        gdal.ErrorReset()
+        if (len(band.ReadRaster() or b"") != config.PIXELS ** 2 * 4
+                or gdal.GetLastErrorType() >= gdal.CE_Failure):
+            return "GeoTIFF illisible ou corrompu : lecture complète des pixels impossible"
+        return None
+    except (RuntimeError, ValueError, OSError) as error:
+        return f"GeoTIFF illisible : {error}"
     finally:
         ds = None
         gdal.PopErrorHandler()
+
+
+def check_geotiff(path, xy=None):
+    return geotiff_error(path, xy) is None
 
 
 @contextmanager
@@ -114,13 +170,15 @@ def download_block(xmin, ymin, dest, is_canceled):
                   BBOX=f"{xmin},{ymin},{xmin + config.BLOCK_M},{ymin + config.BLOCK_M}",
                   WIDTH=config.PIXELS, HEIGHT=config.PIXELS, FORMAT="image/geotiff", EXCEPTIONS="text/xml")
     request = Request(config.WMS_URL + "?" + urlencode(params),
-                      headers={"User-Agent": "QGIS-LiDAR-HD-2026/0.1.0"})
+                      headers={"User-Agent": "QGIS-LiDAR-HD-2026/0.1.1"})
     for attempt in range(1, config.MAX_ATTEMPTS + 1):
         if is_canceled():
             raise DownloadCancelled()
         try:
             with temporary_sibling(dest) as tmp:
                 with urlopen(request, timeout=90) as response, tmp.open("wb") as stream:
+                    status = getattr(response, "status", None)
+                    content_type = getattr(response, "headers", {}).get("Content-Type", "non indiqué")
                     while True:
                         if is_canceled():
                             raise DownloadCancelled()
@@ -128,8 +186,9 @@ def download_block(xmin, ymin, dest, is_canceled):
                         if not chunk:
                             break
                         stream.write(chunk)
-                if not check_geotiff(tmp, (xmin, ymin)):
-                    raise RuntimeError(f"Réponse IGN non GeoTIFF Float32 valide : {xmin},{ymin}")
+                error = geotiff_error(tmp, (xmin, ymin))
+                if error is not None:
+                    raise RuntimeError(f"{error} (HTTP {status or 'non indiqué'}, Content-Type {content_type}, {tmp.stat().st_size} octets)")
                 if is_canceled():
                     raise DownloadCancelled()
                 size = tmp.stat().st_size
@@ -162,8 +221,9 @@ def copy_tile(source, dest, xy, is_canceled):
                     if not chunk:
                         break
                     dst.write(chunk)
-            if not check_geotiff(tmp, xy):
-                raise RuntimeError(f"Copie invalide : {source}")
+            error = geotiff_error(tmp, xy)
+            if error is not None:
+                raise RuntimeError(f"Copie invalide : {source} : {error}")
             size = tmp.stat().st_size
             tmp.replace(dest)
             return size
@@ -254,10 +314,21 @@ def diagnose(blocks, cache, root, name, mode="local"):
 
 
 def build_vrt(dest, paths, blocks):
+    if not paths or len(paths) != len(blocks):
+        raise RuntimeError("VRT : liste de blocs absente ou incohérente")
+    for path, xy in zip(paths, blocks):
+        error = geotiff_error(path, xy)
+        if error is not None:
+            raise RuntimeError(f"VRT : {path.name} : {error}")
     with temporary_sibling(dest) as tmp:
         ds = gdal.BuildVRT(str(tmp), [str(p) for p in paths],
                            options=gdal.BuildVRTOptions(resolution="highest", srcNodata=config.NODATA,
-                                                        VRTNodata=config.NODATA))
+                                                        VRTNodata=config.NODATA,
+                                                        outputSRS="EPSG:2154",
+                                                        # Chaque entrée a été validée en Lambert-93 ci-dessus.
+                                                        # Tolérer uniquement leurs descriptions WKT différentes,
+                                                        # notamment le GEOGCS incomplet IGN ; aucune reprojection.
+                                                        allowProjectionDifference=True))
         if ds is None:
             raise RuntimeError("Échec de création du VRT.")
         ds.FlushCache()

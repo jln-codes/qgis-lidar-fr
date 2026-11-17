@@ -7,8 +7,9 @@ from qgis.gui import QgsMapLayerComboBox
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import QSettings, QTimer, Qt
 from qgis.PyQt.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
-                                QFormLayout, QHBoxLayout, QLabel, QLineEdit,
-                                QProgressBar, QPushButton, QVBoxLayout, QWidget)
+                                QFormLayout, QFrame, QGridLayout, QGroupBox,
+                                QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+                                QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from . import config
 from .engine import LidarDownloadTask, diagnose, storage_root
@@ -22,7 +23,6 @@ class LidarDialog(QDialog):
         super().__init__(iface.mainWindow())
         self.iface = iface
         self.setWindowTitle("LiDAR HD 2026")
-        self.setMinimumWidth(510)
         self.setWindowModality(Qt.NonModal)
         self.selected = set()
         self.capture = None
@@ -34,58 +34,94 @@ class LidarDialog(QDialog):
         self._signals = []
         self._layer_signals = []
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
+        content = QWidget(self)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(16)
         self.parameters = QWidget(self)
-        form = QFormLayout(self.parameters)
+        grid = QGridLayout(self.parameters)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(18)
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
+        footprint_box = QGroupBox("Emprise", self.parameters)
+        output_box = QGroupBox("Fichiers", self.parameters)
+        grid.addWidget(footprint_box, 0, 0)
+        grid.addWidget(output_box, 0, 1)
+        footprint_form = QFormLayout(footprint_box)
+        output_form = QFormLayout(output_box)
+        for form in (footprint_form, output_form):
+            form.setContentsMargins(12, 18, 12, 14)
+            form.setHorizontalSpacing(10)
+            form.setVerticalSpacing(12)
+            form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         self.layer = QgsMapLayerComboBox(self)
         self.layer.setFilters(QgsMapLayerProxyModel.PolygonLayer)
         self.layer.setShowCrs(True)
-        form.addRow("Couche polygonale", self.layer)
+        self.layer.setToolTip("Couche Polygon ou MultiPolygon du projet, avec un SCR valide.")
+        footprint_form.addRow("Couche", self.layer)
         self.mode = QComboBox(self)
-        self.mode.addItems(["Toutes les entités", "Sélectionner sur la carte"])
-        form.addRow("Emprise", self.mode)
-        self.select_button = QPushButton("Sélectionner sur la carte…", self)
-        form.addRow("", self.select_button)
+        self.mode.addItems(["Toutes les entités", "Sur la carte"])
+        self.mode.setToolTip("Toutes les entités de la couche, indépendamment de la sélection QGIS, "
+                             "ou choix de polygones dans plusieurs couches visibles.")
+        footprint_form.addRow("Entités", self.mode)
+        self.select_button = QPushButton("Choisir les polygones…", self)
+        self.select_button.setToolTip("Clic gauche : ajouter ou retirer un polygone. Clic droit : terminer. "
+                                      "Échap : annuler. Les géométries sources restent intactes.")
+        footprint_form.addRow("", self.select_button)
         self.selection_label = QLabel("", self)
         self.selection_label.setWordWrap(True)
-        form.addRow("", self.selection_label)
+        footprint_form.addRow("", self.selection_label)
         self.buffer = QDoubleSpinBox(self)
         self.buffer.setRange(0, 100)
         self.buffer.setDecimals(1)
         self.buffer.setValue(25)
         self.buffer.setSuffix(" m")
-        form.addRow("Tampon spatial", self.buffer)
-        label = QLabel("Le tampon augmente l'emprise extraite, après transformation en EPSG:2154.", self)
-        label.setWordWrap(True)
-        form.addRow("", label)
+        self.buffer.setToolTip("Augmente l'emprise extraite de 0 à 100 m (25 m par défaut), "
+                               "après transformation des polygones en EPSG:2154.")
+        footprint_form.addRow("Tampon", self.buffer)
         self.name = QLineEdit("mnt_lidar_hd", self)
-        form.addRow("Nom de l'extraction", self.name)
+        self.name.setToolTip("Nom du dossier et du VRT. Une extraction existante ne sera jamais écrasée.")
+        output_form.addRow("Nom", self.name)
         self.storage = QComboBox(self)
-        self.storage.addItem("Disque local — recommandé", "local")
-        self.storage.addItem("Pool commun", "pool")
+        self.storage.addItem("Disque local", "local")
+        self.storage.addItem("Pool commun" if config.POOL_ROOT is not None else "Pool non configuré", "pool")
+        self.storage.setToolTip("Disque local recommandé : dossier autonome avec VRT et GeoTIFF. "
+                               + ("Pool désactivé : emplacement partagé non configuré."
+                                  if config.POOL_ROOT is None else f"Pool partagé : {config.POOL_ROOT}"))
         if config.POOL_ROOT is None:
             self.storage.model().item(1).setEnabled(False)
-        form.addRow("Stockage", self.storage)
-        self.pool_note = QLabel("Pool commun désactivé : emplacement réel non configuré."
-                                if config.POOL_ROOT is None else f"Pool commun : {config.POOL_ROOT}", self)
-        self.pool_note.setWordWrap(True)
-        form.addRow("", self.pool_note)
+        output_form.addRow("Stockage", self.storage)
         row = QWidget(self)
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
         self.directory = QLineEdit(QSettings().value("lidar_hd_2026/directory", "", type=str), self)
+        self.directory.setToolTip("Dossier existant où sera créé le sous-dossier portant le nom de l'extraction.")
         self.browse = QPushButton("Parcourir…", self)
         row_layout.addWidget(self.directory)
         row_layout.addWidget(self.browse)
-        form.addRow("Dossier local", row)
-        layout.addWidget(self.parameters)
+        output_form.addRow("Dossier", row)
+        content_layout.addWidget(self.parameters)
+        diagnostic_box = QGroupBox("Prédiagnostic", content)
+        diagnostic_layout = QVBoxLayout(diagnostic_box)
+        diagnostic_layout.setContentsMargins(12, 18, 12, 14)
         self.diagnostic = QLabel(self)
         self.diagnostic.setTextFormat(Qt.PlainText)
         self.diagnostic.setWordWrap(True)
         self.diagnostic.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.diagnostic)
-        note = QLabel("Les blocs sont rectangulaires ; les pixels hors polygones ne sont pas masqués.", self)
-        note.setWordWrap(True)
-        layout.addWidget(note)
+        self.diagnostic.setToolTip("Estimation sans requête IGN, actualisée selon l'emprise et le tampon. "
+                                   "Les blocs sont rectangulaires ; les pixels hors polygones ne sont pas masqués.")
+        diagnostic_layout.addWidget(self.diagnostic)
+        content_layout.addWidget(diagnostic_box)
+        content_layout.addStretch()
+        self.body_scroll = QScrollArea(self)
+        self.body_scroll.setWidgetResizable(True)
+        self.body_scroll.setFrameShape(QFrame.NoFrame)
+        self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.body_scroll.setWidget(content)
+        layout.addWidget(self.body_scroll, 1)
         self.progress = QProgressBar(self)
         self.progress.setValue(0)
         layout.addWidget(self.progress)
@@ -116,6 +152,9 @@ class LidarDialog(QDialog):
             self._signals.append((signal, self.watch_layers))
         self.watch_layers()
         self.refresh_diagnostic()
+        available = self.screen().availableGeometry()
+        self.setMinimumWidth(min(740, max(320, available.width() - 40)))
+        self.resize(min(820, available.width() - 40), min(640, available.height() - 48))
 
     def watch_layers(self, *_):
         for layer, signal, callback in self._layer_signals:
@@ -161,9 +200,8 @@ class LidarDialog(QDialog):
         self.layer.setEnabled(not cartographic)
         self.select_button.setEnabled(cartographic and self.task is None)
         self.selection_label.setText(
-            f"{len(self.selected)} entité(s) dans {len({lid for lid, _ in self.selected})} couche(s). "
-            "Clic gauche : ajouter/retirer ; clic droit : terminer ; Échap : annuler."
-            if cartographic else "Toutes les entités de la couche, indépendamment de sa sélection QGIS.")
+            f"{len(self.selected)} entité(s) · {len({lid for lid, _ in self.selected})} couche(s)")
+        self.selection_label.setVisible(cartographic)
         self.directory.setEnabled(self.storage.currentData() == "local")
         self.browse.setEnabled(self.storage.currentData() == "local")
         if self.task is not None:

@@ -28,7 +28,7 @@ from qgis.gui import QgsMapCanvas, QgsMapToolPan
 from qgis.PyQt.QtCore import QEventLoop, QPoint, QSize, QSettings, QThread, QTimer, Qt
 from qgis.PyQt.QtGui import QColor, QImage, QPainter
 from qgis.PyQt.QtSvg import QSvgRenderer
-from qgis.PyQt.QtWidgets import QMainWindow, QToolBar
+from qgis.PyQt.QtWidgets import QGridLayout, QGroupBox, QMainWindow, QToolBar
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "LiDAR"), str(ROOT / "plugin")]
@@ -76,6 +76,16 @@ def fake_tiff(path, xy=(X, Y), value=42, dtype=gdal.GDT_Float32, nodata=-9999):
     band.Fill(value)
     ds = None
     return path
+
+
+def ign_projection():
+    """Métadonnées IGN reproduites sur des pixels synthétiques, sans réseau."""
+    srs=osr.SpatialReference()
+    srs.SetLCC(49,44,46.5,3,700000,6600000)
+    srs.SetGeogCS("unknown","unnamed","unretrievable - using WGS84",6378137,298.257223563)
+    srs.SetProjCS("EPSG:2154")
+    srs.SetLinearUnits("metre",1)
+    return srs
 
 
 class Interface:
@@ -222,6 +232,77 @@ class PluginTests(unittest.TestCase):
         ds.SetProjection(srs.ExportToWkt()); ds = None
         self.assertFalse(engine.check_geotiff(path))
 
+    def test_ign_incomplete_crs_and_mixed_vrt_preserve_pixels_and_cache(self):
+        xy=(X,Y); other=(X+256,Y)
+        raw=fake_tiff(engine.tile_path(self.cache,xy))
+        ds=gdal.Open(str(raw),gdal.GA_Update); ds.SetProjection(ign_projection().ExportToWkt()); ds=None
+        official=osr.SpatialReference(); official.ImportFromEPSG(2154)
+        # Reproduire exactement le faux rejet de v0.1.0, sans le conserver en production.
+        ds=gdal.Open(str(raw)); actual=ds.GetSpatialRef(); self.assertFalse(actual.IsSame(official)); ds=None
+        before=raw.read_bytes()
+        self.assertIsNone(engine.geotiff_error(raw,xy))
+        fake_tiff(engine.tile_path(self.cache,other),other,value=91)
+        task=self.task(self.plan((xy,other)))
+        self.assertEqual(task.plan.download_count,0)
+        self.assertTrue(task.run(),task.error)
+        self.assertEqual(task.transferred,0)
+        self.assertEqual(raw.read_bytes(),before)
+        vrt=gdal.Open(str(task.vrt)); self.assertTrue(vrt.GetSpatialRef().IsSame(official))
+        self.assertEqual(len(ET.parse(task.vrt).findall(".//SourceFilename")),2)
+        self.assertEqual(vrt.GetRasterBand(1).ReadRaster(0,0,512,512),gdal.Open(str(raw)).ReadRaster())
+
+    def test_ign_crs_exception_does_not_accept_other_projections(self):
+        for kind in ("meridian","easting","name","datum","ellipsoid","unit"):
+            srs=ign_projection()
+            if kind=="meridian": srs.SetProjParm("central_meridian",4)
+            if kind=="easting": srs.SetProjParm("false_easting",600000)
+            if kind=="name": srs.SetProjCS("EPSG:3035")
+            if kind=="datum": srs.SetGeogCS("unknown","WGS_1984","unretrievable - using WGS84",6378137,298.257223563)
+            if kind=="ellipsoid": srs.SetGeogCS("unknown","unnamed","unretrievable - using WGS84",6378200,298.257223563)
+            if kind=="unit": srs.SetLinearUnits("kilometre",1000)
+            with self.subTest(kind=kind):
+                self.assertFalse(engine.is_lambert93(srs))
+
+    def test_geotiff_errors_distinguish_metadata_format_and_corruption(self):
+        path=self.work/"inspect.tif"
+        for dtype,nodata,message in ((gdal.GDT_Int16,-9999,"Type incorrect"),(gdal.GDT_Float32,0,"NoData incorrect")):
+            fake_tiff(path,dtype=dtype,nodata=nodata)
+            self.assertIn(message,engine.geotiff_error(path))
+        fake_tiff(path); ds=gdal.Open(str(path),gdal.GA_Update); ds.GetRasterBand(1).DeleteNoDataValue(); ds=None
+        self.assertIn("NoData incorrect",engine.geotiff_error(path))
+        fake_tiff(path); ds=gdal.Open(str(path),gdal.GA_Update); ds.SetProjection(""); ds=None
+        self.assertIn("SCR absent",engine.geotiff_error(path))
+        fake_tiff(path); ds=gdal.Open(str(path),gdal.GA_Update)
+        bad=osr.SpatialReference();bad.ImportFromEPSG(4326);ds.SetProjection(bad.ExportToWkt());ds=None
+        self.assertIn("SCR incorrect",engine.geotiff_error(path))
+        with self.assertRaisesRegex(RuntimeError,"SCR incorrect"):
+            engine.build_vrt(self.work/"invalid.vrt",[path],[(X,Y)])
+        self.assertFalse((self.work/"invalid.vrt").exists())
+        fake_tiff(path); ds=gdal.Open(str(path),gdal.GA_Update); ds.SetGeoTransform((X,1,0,Y+256,0,-.5)); ds=None
+        self.assertIn("Grille incorrecte",engine.geotiff_error(path))
+        fake_tiff(path); ds=gdal.Open(str(path),gdal.GA_Update); ds.SetGeoTransform((float("nan"),.5,0,Y+256,0,-.5)); ds=None
+        self.assertIn("Grille incorrecte",engine.geotiff_error(path,(X,Y)))
+        fake_tiff(path); self.assertIn("Emprise incorrecte",engine.geotiff_error(path,(X+256,Y)))
+        path.write_bytes(path.read_bytes()[:8000]); self.assertIn("illisible",engine.geotiff_error(path))
+        path.write_bytes(b'<?xml version="1.0"?><ServiceException>Erreur IGN</ServiceException>')
+        with patch.object(engine.gdal,"Open",side_effect=AssertionError("XML ne doit pas être ouvert par GDAL")):
+            self.assertIn("Format inattendu",engine.geotiff_error(path))
+
+    def test_download_accepts_ign_metadata_and_reports_protocol_details(self):
+        source=fake_tiff(self.work/"response.tif")
+        ds=gdal.Open(str(source),gdal.GA_Update);ds.SetProjection(ign_projection().ExportToWkt());ds=None
+        payload=source.read_bytes(); response=io.BytesIO(payload)
+        response.status=200;response.headers={"Content-Type":"image/geotiff"}
+        dest=engine.tile_path(self.cache,(X,Y))
+        with patch.object(engine,"urlopen",return_value=response):
+            self.assertEqual(engine.download_block(X,Y,dest,lambda:False),len(payload))
+        self.assertTrue(engine.check_geotiff(dest,(X,Y)))
+        response=io.BytesIO(b"<ServiceException>Erreur IGN</ServiceException>")
+        response.status=200; response.headers={"Content-Type":"text/xml"}
+        with patch.object(engine,"urlopen",return_value=response):
+            with self.assertRaisesRegex(RuntimeError,"Format inattendu.*HTTP 200, Content-Type text/xml"):
+                engine.download_block(X+256,Y,engine.tile_path(self.cache,(X+256,Y)),lambda:False)
+
     def test_names_and_conflicts_no_overwrite(self):
         for name in ("", "../test", "a/b", "a\\b", "test.", "test ", "CON", "com1.txt", "x:y"):
             with self.subTest(name=name), self.assertRaises(ValueError): self.plan(name=name)
@@ -303,7 +384,7 @@ class PluginTests(unittest.TestCase):
             with self.assertRaises(RuntimeError): engine.download_block(X,Y,dest,lambda:False)
             self.assertEqual(mock.call_count, 1)
         with patch.object(engine,"urlopen",return_value=io.BytesIO(b"<ServiceException/>")):
-            with self.assertRaisesRegex(RuntimeError,"non GeoTIFF"): engine.download_block(X,Y,dest,lambda:False)
+            with self.assertRaisesRegex(RuntimeError,"Format inattendu"): engine.download_block(X,Y,dest,lambda:False)
         with self.assertRaises(engine.DownloadCancelled): engine.download_block(X,Y,dest,lambda:True)
         self.assertFalse(dest.exists())
         self.assertFalse(list(dest.parent.glob("*.part")))
@@ -497,18 +578,22 @@ task.finished(success)
         self.assertTrue(dialog.iface.active.isValid())
         self.assertTrue(any("Échec Turbo" in str(message) for message in dialog.iface.messages))
 
+    @unittest.skipIf(Qgis.QGIS_VERSION_INT < 34400,"SIG-Prestations exige QGIS 3.44 ; LiDAR seul est testé sur cette version")
     def test_toolbar_both_plugins_order_unload_reload(self):
         from sig_prestations import classFactory as sigFactory
         for order in ((classFactory,sigFactory),(sigFactory,classFactory)):
             for unload_first in (0,1):
                 with self.subTest(order=order,unload_first=unload_first):
                     iface=self.iface()
+                    iface.window.show()
                     plugins=[factory(iface) for factory in order]
                     for plugin in plugins:
                         plugin.initGui(); plugin.initGui()
                     bars=iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")
                     self.assertEqual(len(bars),1)
                     self.assertEqual(len(bars[0].actions()),2)
+                    self.assertTrue(bars[0].isVisible())
+                    self.assertEqual(bars[0].toolButtonStyle(),Qt.ToolButtonIconOnly)
                     plugins[unload_first].unload()
                     self.assertEqual(len(bars[0].actions()),1)
                     self.assertIs(plugins[1-unload_first].toolbar,bars[0])
@@ -517,6 +602,37 @@ task.finished(success)
                     reloaded=classFactory(iface); reloaded.initGui()
                     self.assertEqual(len(reloaded.toolbar.actions()),1)
                     reloaded.unload(); self.assertEqual(iface.menus,[])
+
+    def test_toolbar_hidden_state_and_text_style_are_restored(self):
+        factories=[classFactory]
+        if Qgis.QGIS_VERSION_INT >= 34400:
+            from sig_prestations import classFactory as sigFactory
+            factories.append(sigFactory)
+        for factory in factories:
+            iface=self.iface(); iface.window.show()
+            bar=QToolBar("SIG-Milieux",iface.window);bar.setObjectName("SIGMilieuxToolbar")
+            iface.window.addToolBar(bar);bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);bar.hide()
+            plugin=factory(iface)
+            plugin.initGui(); APP.processEvents()
+            self.assertIs(plugin.toolbar,bar)
+            self.assertTrue(bar.isVisible())
+            self.assertTrue(bar.widgetForAction(plugin.action).isVisible())
+            self.assertEqual(bar.widgetForAction(plugin.action).toolButtonStyle(),Qt.ToolButtonIconOnly)
+            self.assertEqual(len(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")),1)
+            plugin.unload()
+
+    def test_dialog_two_parameter_columns_and_full_width_controls(self):
+        layer(); dialog=self.dialog();dialog.show();dialog.refresh_diagnostic();APP.processEvents()
+        self.assertIsInstance(dialog.parameters.layout(),QGridLayout)
+        groups={g.title():g for g in dialog.parameters.findChildren(QGroupBox)}
+        self.assertEqual(groups["Emprise"].y(),groups["Fichiers"].y())
+        self.assertGreater(groups["Fichiers"].x(),groups["Emprise"].x()+groups["Emprise"].width())
+        self.assertGreater(dialog.diagnostic.width(),dialog.parameters.width()-60)
+        for field in (dialog.layer,dialog.mode,dialog.buffer,dialog.name,dialog.storage,dialog.directory):
+            self.assertTrue(field.toolTip())
+        for control in (dialog.progress,dialog.extract,dialog.cancel):
+            self.assertTrue(control.isVisible())
+        self.assertEqual((dialog.buffer.minimum(),dialog.buffer.value(),dialog.buffer.maximum()),(0,25,100))
 
     def test_unload_during_capture_and_task(self):
         plugin=classFactory(self.iface()); plugin.initGui(); plugin.show_dialog()

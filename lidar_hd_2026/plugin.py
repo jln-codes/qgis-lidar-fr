@@ -1,6 +1,8 @@
 """Une action ; barre partagée sans dépendance envers SIG-Prestations."""
 from pathlib import Path
 
+from qgis.core import Qgis, QgsMessageLog
+from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction, QToolBar
 
@@ -27,8 +29,15 @@ class LidarPlugin:
         self.action.setObjectName("lidar_hd_2026_action")
         self.action.setToolTip("Extraire un MNT LiDAR HD IGN")
         self.action.triggered.connect(self.show_dialog)
+        self.toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.toolbar.addAction(self.action)
+        self.toolbar.show()
         self.iface.addPluginToMenu("SIG-Milieux", self.action)
+        metadata = Path(__file__).with_name("metadata.txt").read_text(encoding="utf-8")
+        version = next((line.partition("=")[2].strip() for line in metadata.splitlines()
+                        if line.startswith("version=")), "inconnue")
+        QgsMessageLog.logMessage(f"Plugin chargé : version {version} ; chemin {Path(__file__).resolve()}",
+                                 "LiDAR HD 2026", Qgis.Info)
 
     def show_dialog(self, *_):
         if self.dialog is None:

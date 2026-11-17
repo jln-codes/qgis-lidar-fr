@@ -24,7 +24,7 @@ from qgis.PyQt.QtWidgets import QToolBar
 from qgis.utils import iface
 
 ROOT = Path(os.environ["LIDAR_PROJECT_ROOT"])
-OUTPUT = ROOT / "audits/lidar-desktop"
+OUTPUT = Path(os.environ.get("LIDAR_SMOKE_OUTPUT", str(ROOT / "audits/lidar-desktop")))
 OUTPUT.mkdir(parents=True, exist_ok=True)
 WORK = tempfile.TemporaryDirectory(prefix="run-", dir=OUTPUT)
 WORK_PATH = Path(WORK.name)
@@ -94,26 +94,48 @@ def start():
     for name, folder in (("lidar_hd_2026", "LiDAR"), ("sig_prestations", "plugin")):
         metadata = configparser.ConfigParser(interpolation=None)
         metadata.read(ROOT / folder / name / "metadata.txt", encoding="utf-8")
-        archives.append(ROOT / f"plugin/dist/{name}-{metadata['general']['version']}.zip")
+        default=ROOT / f"plugin/dist/{name}-{metadata['general']['version']}.zip"
+        override="LIDAR_SMOKE_SIG_ZIP" if name=="sig_prestations" else "LIDAR_SMOKE_LIDAR_ZIP"
+        archives.append(Path(os.environ.get(override,str(default))))
     for archive in archives:
         with ZipFile(archive) as z:
             z.extractall(installed)
     sys.path.insert(0, str(installed))
     from lidar_hd_2026 import classFactory as lidar_factory
     from sig_prestations import classFactory as sig_factory
+    import lidar_hd_2026, sig_prestations
+    RESULT["installed_packages"] = {}
+    for name, package in (("lidar_hd_2026",lidar_hd_2026),("sig_prestations",sig_prestations)):
+        metadata=configparser.ConfigParser(interpolation=None)
+        metadata.read(Path(package.__file__).with_name("metadata.txt"),encoding="utf-8")
+        RESULT["installed_packages"][name]={"version":metadata["general"]["version"],"path":package.__file__}
     lidar = lidar_factory(iface); sig = sig_factory(iface)
     PLUGINS.extend([sig, lidar])
     sig.initGui(); lidar.initGui(); lidar.initGui()
     toolbar = iface.mainWindow().findChild(QToolBar, "SIGMilieuxToolbar")
+    iface.mainWindow().resize(1280, 900)
+    QTest.qWait(100)
+    RESULT["toolbar_geometry"] = [toolbar.width(),toolbar.height()]
+    RESULT["toolbar_buttons"] = [{"visible":toolbar.widgetForAction(a).isVisible(),
+                                 "style":int(toolbar.widgetForAction(a).toolButtonStyle()),
+                                 "text":a.text()} for a in toolbar.actions()]
+    record("vérification de la barre")
     assert len(toolbar.actions()) == 2
+    assert toolbar.isVisible()
+    assert toolbar.toolButtonStyle() == Qt.ToolButtonIconOnly
+    assert all(toolbar.widgetForAction(a).isVisible() and
+               toolbar.widgetForAction(a).toolButtonStyle()==Qt.ToolButtonIconOnly for a in toolbar.actions())
+    toolbar.hide(); toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
     sig.unload(); assert len(toolbar.actions()) == 1
     PLUGINS.remove(sig)
     sig = sig_factory(iface); sig.initGui(); PLUGINS.insert(0, sig)
     assert len(toolbar.actions()) == 2
+    assert toolbar.isVisible() and toolbar.toolButtonStyle()==Qt.ToolButtonIconOnly
     RESULT["toolbar_load_unload"] = True
     record("barre commune validée")
     layers = create_inputs()
     iface.mainWindow().resize(1280, 900)
+    toolbar.grab().save(str(OUTPUT/"toolbar.png"))
     canvas = iface.mapCanvas()
     canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:2154"))
     canvas.setLayers(layers)
@@ -139,6 +161,8 @@ def start():
         assert dialog.plan.cached == 2 and dialog.extract.isEnabled()
         RESULT["map_click_selection"] = True
         record("sélection cartographique validée")
+        QTest.qWait(300)
+        assert dialog.diagnostic.height() >= dialog.diagnostic.fontMetrics().height()*8
         dialog.grab().save(str(OUTPUT / "prediagnostic.png"))
         dialog.extract.click()
         QTimer.singleShot(100, guarded(lambda: wait_for_task(lidar, layers)))
@@ -173,6 +197,8 @@ def wait_for_task(plugin, sources):
         record("sauvegarde du projet")
         assert project.write(str(project_file)), project.error()
         record("projet sauvegardé")
+        iface.mapCanvas().stopRendering()
+        iface.mapCanvas().setLayers([])
         project.clear()
         record("projet vidé")
         shutil.rmtree(WORK_PATH / "cache")
