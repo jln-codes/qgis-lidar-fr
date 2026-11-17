@@ -1,4 +1,4 @@
-"""MNT LiDAR HD IGN — chargement sélectif depuis une couche polygonale QGIS.
+"""MNT LiDAR HD IGN — chargement sélectif asynchrone, diagnostic QGIS 3.34–3.44.
 
 Exécution : ouvrir le script dans l'éditeur Python intégré de QGIS et cliquer
 sur « Exécuter ». Une couche vectorielle nommée « emprise » doit être chargée.
@@ -9,6 +9,7 @@ sur disque et sont réutilisables entre sessions QGIS.
 
 import hashlib
 import traceback
+from datetime import datetime
 import math
 import time
 from pathlib import Path
@@ -51,7 +52,21 @@ WMS_LAYER = "IGNF_LIDAR-HD_MNT_ELEVATION.ELEVATIONGRIDCOVERAGE.LAMB93"
 OUTPUT_LAYER_NAME = "MNT LiDAR HD IGN — emprise (VRT)"
 VRT_PREFIX = "mnt_lidar_ign_emprise_v03_"
 TASK_DESCRIPTION = "IGN LiDAR HD — téléchargement des blocs"
-# -----------------------------------------------------------------------
+# Conserver une référence Python explicite pendant toute la tâche asynchrone.
+# La variable reste disponible dans la console QGIS après exec(...).
+_LIDAR_IGN_TASK_REFS = globals().setdefault("_LIDAR_IGN_TASK_REFS", [])
+
+
+def lidar_log(message):
+    """Diagnostic persistant pour les erreurs parfois invisibles en console."""
+    line = f"[{datetime.now().isoformat(timespec='seconds')}] {message}"
+    print(line, flush=True)
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with (CACHE_DIR / "lidar_ign_diagnostic.log").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as err:
+        print(f"Journal indisponible : {err}")
 
 
 def find_emprise_layer():
@@ -214,10 +229,23 @@ def create_altitude_renderer(raster):
     # Bornes provisoires uniquement : aucune lecture des pixels ici. Au premier
     # rendu, UpdatedCanvas calcule les min/max estimés de la vue et reclasse la
     # rampe. Ne pas appeler bandStatistics(1) : sampleSize=0 lirait tout le VRT.
+    # Énumérations déplacées en 3.38 : les anciens noms restent nécessaires
+    # sous QGIS 3.34 (Prizren). QGIS 3.40/3.44 utilisent les noms Qgis.
+    if (hasattr(Qgis, "ShaderInterpolationMethod")
+            and hasattr(Qgis, "ShaderClassificationMethod")):
+        interpolation = Qgis.ShaderInterpolationMethod.Linear
+        classification = Qgis.ShaderClassificationMethod.Continuous
+        shader_api = "Qgis (>= 3.38)"
+    else:
+        interpolation = QgsColorRampShader.Interpolated
+        classification = QgsColorRampShader.Continuous
+        shader_api = "QgsColorRampShader (QGIS 3.34)"
+    lidar_log(f"RENDU : énumérations interpolation/classification = {shader_api}")
+
     color_shader = QgsColorRampShader(
         0.0, 1.0, ramp,
-        Qgis.ShaderInterpolationMethod.Linear,
-        Qgis.ShaderClassificationMethod.Continuous,
+        interpolation,
+        classification,
     )
     color_shader.classifyColorRamp()
     shader = QgsRasterShader(0.0, 1.0)
@@ -228,7 +256,7 @@ def create_altitude_renderer(raster):
 
     origin = QgsRasterMinMaxOrigin()
     # QGIS 3.42 moved these enums from QgsRasterMinMaxOrigin to Qgis.
-    # Keep the same native settings on QGIS 3.40 LTR and QGIS 3.44 LTR.
+    # Maintenir les mêmes réglages natifs de QGIS 3.34 à QGIS 3.44.
     if hasattr(Qgis, "RasterRangeLimit"):
         origin.setLimits(Qgis.RasterRangeLimit.MinimumMaximum)
         origin.setExtent(Qgis.RasterRangeExtent.UpdatedCanvas)
@@ -244,8 +272,10 @@ def create_altitude_renderer(raster):
 def build_and_show_vrt(blocks, transferred, failed, elapsed_download):
     """Appel uniquement depuis le thread principal QGIS, après la tâche réseau."""
     started = time.monotonic()
+    lidar_log("FINALISATION : entrée dans build_and_show_vrt")
     paths = [output_path(x, y) for x, y in blocks]
     available_paths = [path for path in paths if check_geotiff(path)]
+    lidar_log(f"CACHE : {len(available_paths)}/{len(paths)} GeoTIFF valides")
     if not available_paths:
         raise RuntimeError("Aucun GeoTIFF valide à assembler.")
     if len(available_paths) != len(paths):
@@ -269,6 +299,7 @@ def build_and_show_vrt(blocks, transferred, failed, elapsed_download):
 
     # Pour une liste déjà connue, conserver le VRT existant validé. Les
     # nouveaux blocs aboutissent à un nouveau nom, sans écraser l'ancien.
+    lidar_log(f"VRT : chemin={vrt_path}, existe={vrt_path.exists()}")
     if not vrt_path.exists():
         ds = gdal.BuildVRT(
             str(vrt_path),
@@ -300,34 +331,51 @@ def build_and_show_vrt(blocks, transferred, failed, elapsed_download):
         max(x for x, y in available_blocks) + BLOCK_M,
         max(y for x, y in available_blocks) + BLOCK_M,
     )
+    lidar_log(f"VRT : emprise réelle={actual} ; attendue={expected}")
     if any(abs(a - b) > 0.01 for a, b in zip(actual, expected)):
         raise RuntimeError(
             f"Emprise VRT incorrecte : {actual}, attendue : {expected}. "
             "Aucune nouvelle couche ajoutée."
         )
 
-    # Préparer et valider la nouvelle couche AVANT d'enlever l'ancienne.
-    # Ainsi, une erreur de symbologie ne vide pas le canevas QGIS.
+    # Ajouter d'abord un raster GDAL valide, même si Turbo échoue.
+    # Cette séquence évite le symptôme « tuiles présentes, aucune couche QGIS ».
     raster = QgsRasterLayer(str(vrt_path), OUTPUT_LAYER_NAME, "gdal")
+    lidar_log(f"RASTER : validité GDAL/QGIS={raster.isValid()} ; source={raster.source()}")
     if not raster.isValid():
         raise RuntimeError("VRT créé, mais impossible de l'ajouter à QGIS.")
-    raster.setRenderer(create_altitude_renderer(raster))
 
     project = QgsProject.instance()
-    # Nettoyer les anciennes couches du prototype, SANS supprimer les GeoTIFF
-    # ni les fichiers VRT : un projet QGIS sauvegardé pourrait y faire référence.
-    for old in list(project.mapLayers().values()):
+    old_layers = [
+        old for old in list(project.mapLayers().values())
         if (isinstance(old, QgsRasterLayer)
-                and old.providerType() == "gdal"
-                and old.name() == OUTPUT_LAYER_NAME
-                and Path(old.source()).suffix.lower() == ".vrt"
-                and Path(old.source()).parent == CACHE_DIR):
-            project.removeMapLayer(old.id())
-
+            and old.providerType() == "gdal"
+            and old.name() == OUTPUT_LAYER_NAME
+            and Path(old.source()).suffix.lower() == ".vrt"
+            and Path(old.source()).parent == CACHE_DIR)
+    ]
     project.addMapLayer(raster)
+    lidar_log(f"PROJET : raster ajouté (id={raster.id()})")
+    try:
+        # La symbologie ne doit jamais empêcher l'affichage du MNT lui-même.
+        raster.setRenderer(create_altitude_renderer(raster))
+        lidar_log("RENDU : pseudocouleur Turbo / Updated Canvas appliquée")
+    except Exception:
+        lidar_log("RENDU : ECHEC ; raster conservé avec le rendu GDAL par défaut")
+        lidar_log(traceback.format_exc())
+        iface.messageBar().pushMessage(
+            "LiDAR IGN",
+            "Raster ajouté sans Turbo : consulter lidar_ign_diagnostic.log",
+            level=Qgis.Warning, duration=15,
+        )
+
+    for old in old_layers:
+        if old.id() != raster.id():
+            project.removeMapLayer(old.id())
     iface.setActiveLayer(raster)
     iface.zoomToActiveLayer()
     iface.mapCanvas().refreshAllLayers()
+    lidar_log("CANEVAS : couche active, zoom et rafraîchissement demandés")
 
     print(f"Emprise VRT (EPSG:2154) : {expected}")
     print("\nCouche VRT ajoutée à QGIS." + (" (INCOMPLÈTE)" if len(available_paths) < len(paths) else " (COMPLÈTE)"))
@@ -339,6 +387,7 @@ def build_and_show_vrt(blocks, transferred, failed, elapsed_download):
           "ne sont pas masqués dans le VRT.")
     print(f"Temps tâche téléchargement : {elapsed_download:.2f} s")
     print(f"Temps assemblage et affichage : {time.monotonic() - started:.2f} s")
+    lidar_log("FINALISATION : terminée")
 
 
 class LidarDownloadTask(QgsTask):
@@ -380,6 +429,7 @@ class LidarDownloadTask(QgsTask):
                 self.setProgress(100.0 * processed / total)
                 if index < len(self.missing):
                     interruptible_pause(REQUEST_PAUSE_SECONDS, self.isCanceled)
+            lidar_log(f"TACHE : boucle terminée ; traités={processed}/{total}, échecs={len(self.failed)}")
             return not self.isCanceled()
         except DownloadCancelled:
             return False
@@ -391,6 +441,7 @@ class LidarDownloadTask(QgsTask):
 
     def finished(self, success):
         """QgsTaskManager appelle cette méthode sur le thread principal."""
+        lidar_log(f"CALLBACK : finished(success={success}, canceled={self.isCanceled()})")
         try:
             if self.isCanceled():
                 print("LiDAR IGN : téléchargement annulé. Tuiles déjà validées conservées.")
@@ -418,11 +469,18 @@ class LidarDownloadTask(QgsTask):
                 duration=10,
             )
         except Exception:
+            lidar_log("CALLBACK : ERREUR DE FINALISATION")
+            lidar_log(traceback.format_exc())
             print("LiDAR IGN : échec d'assemblage/affichage :", traceback.format_exc())
             iface.messageBar().pushMessage(
                 "LiDAR IGN", "Erreur VRT/rendu ; consulter la console Python.",
                 level=Qgis.Critical, duration=10,
             )
+        finally:
+            try:
+                _LIDAR_IGN_TASK_REFS.remove(self)
+            except ValueError:
+                pass
 
 
 def main():
@@ -455,6 +513,8 @@ def main():
         )
 
     task = LidarDownloadTask(blocks, missing, cached)
+    _LIDAR_IGN_TASK_REFS.append(task)
+    lidar_log(f"DEMARRAGE : QGIS={getattr(Qgis, 'QGIS_VERSION', 'inconnue')} ; blocs={len(blocks)} ; en_cache={cached} ; a_telecharger={len(missing)}")
     QgsApplication.taskManager().addTask(task)
     print("Tâche démarrée dans le gestionnaire QGIS :", task.description())
     print("La progression et le bouton Annuler sont accessibles dans les tâches QGIS.")
