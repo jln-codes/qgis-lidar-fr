@@ -28,6 +28,7 @@ from qgis.gui import QgsMapCanvas, QgsMapToolPan
 from qgis.PyQt.QtCore import QEventLoop, QPoint, QSize, QSettings, QThread, QTimer, Qt
 from qgis.PyQt.QtGui import QColor, QImage, QPainter
 from qgis.PyQt.QtSvg import QSvgRenderer
+from qgis.PyQt.QtTest import QTest
 from qgis.PyQt.QtWidgets import QGridLayout, QGroupBox, QMainWindow, QToolBar
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -562,6 +563,7 @@ task.finished(success)
     def test_task_manager_real_worker_gui_callback_and_turbo_fallback(self):
         source=layer(); fake_tiff(engine.tile_path(self.cache,(X,Y)))
         dialog=self.dialog(); dialog.layer.setLayer(source); dialog.buffer.setValue(0)
+        dialog.show()
         callback_threads=[]
         original=dialog.task_finished
         loop=QEventLoop()
@@ -577,6 +579,101 @@ task.finished(success)
         self.assertIsNone(dialog.task)
         self.assertTrue(dialog.iface.active.isValid())
         self.assertTrue(any("Échec Turbo" in str(message) for message in dialog.iface.messages))
+        QTest.qWait(300)
+        self.assertTrue(dialog.isVisible())
+        self.assertIn("Échec Turbo",dialog.diagnostic.text())
+        self.assertEqual(dialog.iface.messages[-1][1]["level"],Qgis.Warning)
+
+    def test_cached_task_closes_after_success_and_reopens_with_zero_progress(self):
+        source=layer(); fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        plugin=classFactory(self.iface()); plugin.initGui()
+        self.addCleanup(plugin.unload)
+        plugin.action.trigger()
+        dialog=plugin.dialog
+        dialog.layer.setLayer(source); dialog.buffer.setValue(0)
+        dialog.directory.setText(str(self.dest)); dialog.refresh_diagnostic()
+        self.assertEqual((dialog.plan.cached,dialog.plan.download_count),(1,0))
+        dialog.extract.click()
+        loop=QEventLoop()
+        poll=QTimer(); poll.timeout.connect(lambda: loop.quit() if not dialog.isVisible() else None)
+        poll.start(20); QTimer.singleShot(10000,loop.quit); loop.exec_(); poll.stop()
+        self.assertIsNone(dialog.task)
+        self.assertFalse(dialog.isVisible(),dialog.diagnostic.text())
+        self.assertTrue(plugin.iface.active.isValid())
+        self.assertIsInstance(plugin.iface.active.renderer(),QgsSingleBandPseudoColorRenderer)
+        self.assertEqual(plugin.iface.messages[-1][1]["level"],Qgis.Success)
+        plugin.action.trigger()
+        self.assertIs(plugin.dialog,dialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.progress.value(),0)
+        self.assertEqual(plugin.iface.menus,[])
+
+    def test_failed_and_cancelled_tasks_keep_dialog_open(self):
+        dialog=self.dialog(); dialog.show()
+        for cancelled in (False,True):
+            with self.subTest(cancelled=cancelled):
+                task=self.task(); task.error="Échec synthétique"
+                if cancelled:
+                    task.cancel()
+                dialog.task_finished(task,False); APP.processEvents()
+                self.assertTrue(dialog.isVisible())
+                self.assertIn("annulée" if cancelled else "Échec synthétique",dialog.diagnostic.text())
+                self.assertIsNone(dialog.iface.active)
+
+    def test_partial_vrt_never_closes_even_without_failed_list(self):
+        fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        task=self.task(self.plan(blocks=((X,Y),(X+512,Y))))
+        self.assertTrue(task.run())
+        self.assertEqual(len(task.failed),1)
+        dialog=self.dialog(); dialog.show()
+        for report_failures in (True,False):
+            if not report_failures:
+                task.failed.clear()
+            with self.subTest(report_failures=report_failures):
+                dialog.task_finished(task,True); QTest.qWait(250)
+                self.assertTrue(dialog.isVisible())
+                self.assertTrue(dialog.iface.active.isValid())
+                self.assertIn("MNT INCOMPLET",dialog.diagnostic.text())
+                self.assertEqual(dialog.iface.active.customProperty("lidar_hd_2026/missing_blocks"),1)
+                self.assertEqual(dialog.iface.messages[-1][1]["level"],Qgis.Warning)
+
+    def test_invalid_vrt_missing_source_and_failed_project_load_keep_open(self):
+        fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        task=self.task(); self.assertTrue(task.run())
+        dialog=self.dialog(); dialog.show()
+        original=task.vrt.read_bytes()
+        for content in (b"pas un VRT",b'<VRTDataset rasterXSize="0" rasterYSize="0"/>'):
+            with self.subTest(content=content):
+                task.vrt.write_bytes(content)
+                dialog.task_finished(task,True); APP.processEvents()
+                self.assertTrue(dialog.isVisible())
+                self.assertEqual(dialog.iface.messages[-1][1]["level"],Qgis.Critical)
+        task.vrt.write_bytes(original)
+        with patch("lidar_hd_2026.dialog.QgsProject") as project:
+            project.instance.return_value.addMapLayer.return_value=None
+            dialog.task_finished(task,True); APP.processEvents()
+            self.assertTrue(dialog.isVisible())
+            self.assertIn("ajouter le MNT",dialog.diagnostic.text())
+        with patch.object(dialog.iface,"setActiveLayer",return_value=False):
+            dialog.task_finished(task,True); APP.processEvents()
+            self.assertTrue(dialog.isVisible())
+            self.assertIn("activation",dialog.diagnostic.text())
+        source=ET.parse(task.vrt).find(".//SourceFilename")
+        (task.vrt.parent/source.text).unlink()
+        dialog.task_finished(task,True); APP.processEvents()
+        self.assertTrue(dialog.isVisible())
+        self.assertIn("GeoTIFF introuvable",dialog.diagnostic.text())
+
+    def test_toolbar_only_no_extensions_menu_on_reload(self):
+        iface=self.iface()
+        with patch.object(iface,"addPluginToMenu",side_effect=AssertionError("Menu interdit")), \
+             patch.object(iface,"removePluginMenu",side_effect=AssertionError("Menu interdit")):
+            for _ in range(2):
+                plugin=classFactory(iface); plugin.initGui(); plugin.initGui()
+                self.assertEqual(len(plugin.toolbar.actions()),1)
+                self.assertEqual(iface.menus,[])
+                plugin.unload()
+                self.assertEqual(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar"),[])
 
     @unittest.skipIf(Qgis.QGIS_VERSION_INT < 34400,"SIG-Prestations exige QGIS 3.44 ; LiDAR seul est testé sur cette version")
     def test_toolbar_both_plugins_order_unload_reload(self):
@@ -622,7 +719,7 @@ task.finished(success)
             plugin.unload()
 
     def test_dialog_two_parameter_columns_and_full_width_controls(self):
-        layer(); dialog=self.dialog();dialog.show();dialog.refresh_diagnostic();APP.processEvents()
+        layer(); dialog=self.dialog();dialog.show();dialog.refresh_diagnostic();QTest.qWait(300)
         self.assertIsInstance(dialog.parameters.layout(),QGridLayout)
         groups={g.title():g for g in dialog.parameters.findChildren(QGroupBox)}
         self.assertEqual(groups["Emprise"].y(),groups["Fichiers"].y())
@@ -633,6 +730,10 @@ task.finished(success)
         for control in (dialog.progress,dialog.extract,dialog.cancel):
             self.assertTrue(control.isVisible())
         self.assertEqual((dialog.buffer.minimum(),dialog.buffer.value(),dialog.buffer.maximum()),(0,25,100))
+        if dialog.body_scroll.verticalScrollBar().maximum()==0:
+            diagnostic_box=dialog.diagnostic.parentWidget()
+            bottom=diagnostic_box.mapTo(dialog,QPoint(0,diagnostic_box.height())).y()
+            self.assertIn(dialog.progress.y()-bottom,range(12,17))
 
     def test_unload_during_capture_and_task(self):
         plugin=classFactory(self.iface()); plugin.initGui(); plugin.show_dialog()
@@ -757,8 +858,8 @@ from lidar_hd_2026 import classFactory
 class Iface:
  def __init__(self): self.w=QMainWindow()
  def mainWindow(self): return self.w
- def addPluginToMenu(self,*args): pass
- def removePluginMenu(self,*args): pass
+ def addPluginToMenu(self,*args): raise AssertionError('Menu interdit')
+ def removePluginMenu(self,*args): raise AssertionError('Menu interdit')
 p=classFactory(Iface()); p.initGui(); assert not p.action.icon().isNull(); p.unload()
 '''
         subprocess.run([sys.executable,"-c",code,str(installed)],cwd=self.work,check=True,

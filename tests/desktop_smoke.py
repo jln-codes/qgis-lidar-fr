@@ -87,6 +87,11 @@ def create_inputs():
     return layers
 
 
+def assert_no_lidar_menu():
+    assert not any(a.text().replace("&", "") == "SIG-Milieux"
+                   for a in iface.pluginMenu().actions()), "Sous-menu Extensions résiduel"
+
+
 def start():
     record("installation ZIP")
     installed = WORK_PATH / "plugins"; installed.mkdir()
@@ -112,6 +117,7 @@ def start():
     lidar = lidar_factory(iface); sig = sig_factory(iface)
     PLUGINS.extend([sig, lidar])
     sig.initGui(); lidar.initGui(); lidar.initGui()
+    assert_no_lidar_menu()
     toolbar = iface.mainWindow().findChild(QToolBar, "SIGMilieuxToolbar")
     iface.mainWindow().resize(1280, 900)
     QTest.qWait(100)
@@ -132,6 +138,12 @@ def start():
     assert len(toolbar.actions()) == 2
     assert toolbar.isVisible() and toolbar.toolButtonStyle()==Qt.ToolButtonIconOnly
     RESULT["toolbar_load_unload"] = True
+    lidar.unload(); PLUGINS.remove(lidar)
+    assert_no_lidar_menu()
+    lidar=lidar_factory(iface); lidar.initGui(); PLUGINS.append(lidar)
+    assert_no_lidar_menu()
+    assert len(toolbar.actions()) == 2
+    RESULT["extensions_menu_absent_after_reload"] = True
     record("barre commune validée")
     layers = create_inputs()
     iface.mainWindow().resize(1280, 900)
@@ -170,7 +182,9 @@ def start():
 
 
 def wait_for_task(plugin, sources):
-    if plugin.dialog.task is not None:
+    # Le chargement du raster peut traiter des événements Qt avant le retour
+    # du callback ; laisser aussi s'exécuter la fermeture différée.
+    if plugin.dialog.task is not None or plugin.dialog.isVisible():
         QTimer.singleShot(100, guarded(lambda: wait_for_task(plugin, sources)))
         return
     raster = iface.activeLayer()
@@ -181,7 +195,13 @@ def wait_for_task(plugin, sources):
     assert all(n.get("relativeToVRT") == "1" for n in ET.parse(path).findall(".//SourceFilename"))
     RESULT["extract_task_turbo"] = True
     record("extraction et Turbo validés")
-    plugin.dialog.hide()
+    assert not plugin.dialog.isVisible(), plugin.dialog.diagnostic.text()
+    RESULT["automatic_close_cached_extraction"] = True
+    plugin.action.trigger()
+    assert plugin.dialog.isVisible() and plugin.dialog.progress.value() == 0
+    assert_no_lidar_menu()
+    RESULT["reopen_zero_progress"] = True
+    plugin.dialog.close()
     # Le canevas a été configuré explicitement au démarrage de ce test :
     # isoler maintenant le raster pour contrôler son véritable rendu.
     iface.mapCanvas().setLayers([raster])

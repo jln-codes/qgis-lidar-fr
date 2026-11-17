@@ -32,7 +32,6 @@ class LidarPlugin:
         self.toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self.toolbar.addAction(self.action)
         self.toolbar.show()
-        self.iface.addPluginToMenu("SIG-Milieux", self.action)
         metadata = Path(__file__).with_name("metadata.txt").read_text(encoding="utf-8")
         version = next((line.partition("=")[2].strip() for line in metadata.splitlines()
                         if line.startswith("version=")), "inconnue")
@@ -43,7 +42,7 @@ class LidarPlugin:
         if self.dialog is None:
             from .dialog import LidarDialog
             self.dialog = LidarDialog(self.iface)
-        self.dialog.refresh_diagnostic()
+        self.dialog.prepare_show()
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
@@ -53,7 +52,6 @@ class LidarPlugin:
             self.dialog.shutdown()
             self.dialog = None
         if self.action is not None:
-            self.iface.removePluginMenu("SIG-Milieux", self.action)
             self.toolbar.removeAction(self.action)
             self.action.deleteLater()
             self.action = None

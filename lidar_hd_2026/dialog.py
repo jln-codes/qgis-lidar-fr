@@ -1,5 +1,6 @@
 """Petit dialogue natif QGIS ; diagnostic local avant tout téléchargement."""
 from pathlib import Path
+from xml.etree import ElementTree as ET
 
 from qgis.core import (Qgis, QgsApplication, QgsMapLayerProxyModel, QgsProject,
                        QgsRasterLayer)
@@ -12,7 +13,7 @@ from qgis.PyQt.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog
                                 QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from . import config
-from .engine import LidarDownloadTask, diagnose, storage_root
+from .engine import LidarDownloadTask, diagnose, storage_root, tile_path
 from .rendering import create_altitude_renderer
 from .selection import PolygonSelectionTool
 from .spatial import is_polygon, snapshot
@@ -36,6 +37,7 @@ class LidarDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
+        layout.setAlignment(Qt.AlignTop)
         content = QWidget(self)
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
@@ -115,13 +117,12 @@ class LidarDialog(QDialog):
                                    "Les blocs sont rectangulaires ; les pixels hors polygones ne sont pas masqués.")
         diagnostic_layout.addWidget(self.diagnostic)
         content_layout.addWidget(diagnostic_box)
-        content_layout.addStretch()
         self.body_scroll = QScrollArea(self)
         self.body_scroll.setWidgetResizable(True)
         self.body_scroll.setFrameShape(QFrame.NoFrame)
         self.body_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.body_scroll.setWidget(content)
-        layout.addWidget(self.body_scroll, 1)
+        layout.addWidget(self.body_scroll)
         self.progress = QProgressBar(self)
         self.progress.setValue(0)
         layout.addWidget(self.progress)
@@ -133,6 +134,12 @@ class LidarDialog(QDialog):
         for button in (self.extract, self.cancel, close):
             buttons.addWidget(button)
         layout.addLayout(buttons)
+        self.fit_timer = QTimer(self)
+        self.fit_timer.setSingleShot(True)
+        self.fit_timer.timeout.connect(self.fit_content)
+        self.completion_timer = QTimer(self)
+        self.completion_timer.setSingleShot(True)
+        self.completion_timer.timeout.connect(self.close)
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.setInterval(200)
@@ -154,7 +161,38 @@ class LidarDialog(QDialog):
         self.refresh_diagnostic()
         available = self.screen().availableGeometry()
         self.setMinimumWidth(min(740, max(320, available.width() - 40)))
-        self.resize(min(820, available.width() - 40), min(640, available.height() - 48))
+        self.resize(min(820, available.width() - 40), self.height())
+        self.fit_timer.start(0)
+
+    def fit_content(self):
+        """Hauteur utile, avec défilement si l'écran ne peut pas tout afficher."""
+        body_layout = self.body_scroll.widget().layout()
+        body_layout.activate()
+        width = self.body_scroll.viewport().width()
+        height = body_layout.totalHeightForWidth(width)
+        if height < 0:
+            height = body_layout.sizeHint().height()
+        self.body_scroll.setMaximumHeight(height)
+        layout = self.layout()
+        margins = layout.contentsMargins()
+        useful = (height + margins.top() + margins.bottom() + 2 * layout.spacing()
+                  + self.progress.sizeHint().height() + layout.itemAt(2).sizeHint().height())
+        self.resize(self.width(), min(useful, self.screen().availableGeometry().height() - 48))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if event.size().width() != event.oldSize().width():
+            self.fit_timer.start(0)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.fit_timer.start(0)
+
+    def prepare_show(self):
+        self.completion_timer.stop()
+        if self.task is None:
+            self.progress.setValue(0)
+        self.refresh_diagnostic()
 
     def watch_layers(self, *_):
         for layer, signal, callback in self._layer_signals:
@@ -227,6 +265,7 @@ class LidarDialog(QDialog):
             self.extract.setEnabled(True)
         except Exception as error:
             self.diagnostic.setText(str(error))
+        self.fit_timer.start(0)
 
     def start_capture(self):
         if self.capture is not None or self.task is not None:
@@ -271,6 +310,7 @@ class LidarDialog(QDialog):
             self.raise_()
 
     def start_extraction(self):
+        self.completion_timer.stop()
         # Revérifier tous les paramètres et les conflits juste avant la tâche.
         self.refresh_diagnostic()
         if self.plan is None or self.task is not None:
@@ -294,41 +334,74 @@ class LidarDialog(QDialog):
             self.diagnostic.setText("Annulation demandée ; les blocs validés restent en cache pour la reprise.")
 
     def task_finished(self, task, success):
+        self.completion_timer.stop()
         self.task = None
         self.parameters.setEnabled(True)
         self.cancel.setEnabled(False)
         self.refresh_diagnostic()
         try:
             if task.isCanceled():
-                self.capture_message("Extraction annulée ; relancez pour reprendre depuis le cache.")
+                message = "Extraction annulée ; relancez pour reprendre depuis le cache."
+                self.diagnostic.setText(message)
+                self.capture_message(message)
                 return
             if not success or task.vrt is None:
                 raise RuntimeError(task.error or "La tâche a échoué.")
+            # Vérifier le résultat sans réécrire le VRT ni toucher au cache.
+            sources = ET.parse(task.vrt).findall(".//SourceFilename")
+            expected = {tile_path(task.plan.cache, xy).name for xy in task.plan.blocks}
+            present = set()
+            for source in sources:
+                path = Path(source.text or "")
+                if source.get("relativeToVRT") == "1":
+                    path = Path(task.vrt).parent / path
+                if not path.is_file():
+                    raise RuntimeError(f"VRT incomplet : GeoTIFF introuvable : {path}")
+                present.add(path.name)
+            missing = len(expected - present)
+            incomplete = bool(task.failed) or present != expected
             raster = QgsRasterLayer(str(task.vrt), task.plan.name, "gdal")
             if not raster.isValid():
                 raise RuntimeError(f"VRT créé mais illisible par QGIS : {task.vrt}")
-            QgsProject.instance().addMapLayer(raster)
-            raster.setCustomProperty("lidar_hd_2026/missing_blocks", len(task.failed))
+            if QgsProject.instance().addMapLayer(raster) is None:
+                raise RuntimeError("Impossible d'ajouter le MNT au projet QGIS.")
+            raster.setCustomProperty("lidar_hd_2026/missing_blocks", max(missing, len(task.failed)))
+            style_error = None
             try:
-                raster.setRenderer(create_altitude_renderer(raster))
+                renderer = create_altitude_renderer(raster)
+                if renderer is None:
+                    raise RuntimeError("Aucun rendu Turbo disponible.")
+                raster.setRenderer(renderer)
             except Exception as error:
-                self.capture_message(f"Raster conservé avec rendu par défaut. Échec Turbo : {error}")
+                style_error = f"Raster conservé avec rendu par défaut. Échec Turbo : {error}"
             raster.triggerRepaint()
-            self.iface.setActiveLayer(raster)
+            if self.iface.setActiveLayer(raster) is False:
+                raise RuntimeError("MNT ajouté au projet, mais activation de la couche impossible.")
             self.iface.zoomToActiveLayer()
             self.iface.mapCanvas().refreshAllLayers()
-            message = (f"{len(task.plan.blocks) - len(task.failed)}/{len(task.plan.blocks)} blocs ; "
+            message = (f"{len(expected & present)}/{len(expected)} blocs ; "
                        f"IGN : {task.transferred / 1024**2:.2f} Mio ; "
                        f"copie : {task.copied / 1024**2:.2f} Mio.\n{task.vrt}")
-            if task.failed:
+            if incomplete:
                 message += "\nMNT INCOMPLET. Relancez avec un autre nom pour récupérer les blocs manquants.\n"
+                message += f"{missing} bloc(s) attendu(s) absent(s) du VRT.\n"
                 message += "\n".join(f"{xy} : {reason}" for xy, reason in task.failed[:5])
+            if style_error:
+                message += "\n" + style_error
             self.diagnostic.setText(message)
             self.iface.messageBar().pushMessage("LiDAR HD 2026", message,
-                                               level=Qgis.Warning if task.failed else Qgis.Success, duration=15)
+                                               level=Qgis.Warning if incomplete or style_error else Qgis.Success,
+                                               duration=15)
+            if not incomplete and style_error is None:
+                self.completion_timer.start(0)
         except Exception as error:
             self.diagnostic.setText(str(error))
             self.iface.messageBar().pushMessage("LiDAR HD 2026", str(error), level=Qgis.Critical, duration=15)
+        finally:
+            # L'ajout du raster émet layersAdded : conserver le bilan jusqu'à
+            # la prochaine modification volontaire des paramètres.
+            self.timer.stop()
+            self.fit_timer.start(0)
 
     def closeEvent(self, event):
         # Fermer le panneau masque l'interface ; la tâche reste suivie par QGIS.
@@ -338,6 +411,8 @@ class LidarDialog(QDialog):
     def shutdown(self):
         self._closed = True
         self.timer.stop()
+        self.fit_timer.stop()
+        self.completion_timer.stop()
         self.finish_capture(False, restore=False)
         if self.task is not None:
             self.task.callback = None

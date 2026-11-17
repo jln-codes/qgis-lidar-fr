@@ -2,7 +2,7 @@
 name=LiDAR HD 2026
 qgisMinimumVersion=3.34
 qgisMaximumVersion=3.99
-version=0.1.1
+version=0.1.2
 author=SIG Milieux
 description=Extraction sélective du MNT LiDAR HD IGN depuis des polygones, avec prédiagnostic et cache persistant.
 about=Téléchargement asynchrone en Lambert-93, GeoTIFF Float32 et VRT portable, rendu Turbo adaptatif. Pool partagé configurable.
