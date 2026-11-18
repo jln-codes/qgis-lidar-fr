@@ -1,4 +1,4 @@
-# LiDAR HD 2026 — plugin QGIS 0.1.2
+# LiDAR HD 2026 — plugin QGIS 0.1.3
 
 Extension autonome pour extraire le MNT LiDAR HD IGN à partir de polygones.
 Aucune installation de Python ou de bibliothèque supplémentaire n'est nécessaire
@@ -9,7 +9,7 @@ ni importé ni inclus dans le ZIP.
 ## Installation et utilisation
 
 1. Dans QGIS, ouvrir **Extensions → Installer/Gérer les extensions → Installer
-   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.2.zip` dans le dépôt.
+   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.3.zip` dans le dépôt.
 2. Activer **LiDAR HD 2026**. Son unique bouton se trouve dans la barre
    **SIG-Milieux**. Si nécessaire, afficher cette barre via
    **Vue → Barres d'outils**. Le gestionnaire d'extensions reste accessible normalement.
@@ -23,11 +23,13 @@ ni importé ni inclus dans le ZIP.
    Le dialogue et l'outil cartographique précédent sont restaurés à la fin.
 5. Régler le tampon (25 m par défaut, entre 0 et 100 m). Il augmente l'emprise
    après transformation en Lambert-93 ; les géométries sources restent intactes.
-6. Choisir un nom et un dossier existant et inscriptible. Les noms réservés sous
-   Windows sont refusés. Un dossier d'extraction existant n'est jamais écrasé :
-   choisir un autre nom pour une nouvelle extraction.
+6. Choisir la **bibliothèque LiDAR permanente**, existante et inscriptible, puis
+   un nom pour le VRT individuel. Le chemin local est mémorisé. Réutiliser la même
+   bibliothèque évite les copies de tuiles entre extractions. Les noms réservés
+   sous Windows, les VRT existants et les anciens dossiers homonymes sont refusés.
 7. Lire le **prédiagnostic sans requête IGN** : entités, parties, surface cumulée
-   après tampon, blocs, cache valide, téléchargements, transferts IGN et copies.
+   après tampon, blocs dans la bibliothèque, blocs disponibles seulement dans
+   le cache technique, téléchargements IGN et nouvelles données à enregistrer.
    L'estimation initiale vaut 1 Mio par bloc, puis utilise la taille moyenne des
    blocs valides concernés déjà disponibles. Il s'agit d'une estimation, pas
    d'un devis ni d'une garantie de taille des réponses WMS.
@@ -60,44 +62,94 @@ Les blocs sont rectangulaires : les pixels hors polygones ne sont pas masqués.
 
 ## Fichiers et stockage
 
-Le mode local recommandé produit un dossier autonome :
+Les modes **Disque local** et **Pool commun** utilisent la même organisation :
 
 ```text
-<dossier choisi>/<nom>/
-  <nom>.vrt
+LiDAR HD IGN 2026/                  # bibliothèque choisie
   tiles/
-    mnt_l93_<x>_<y>_256m_512px.tif
+    mnt_l93_<x>_<y>_256m_512px.tif   # une copie par bibliothèque
+  extractions/
+    site_A.vrt                     # sources relatives ../tiles/...
+    site_B.vrt
+  mnt_lidar_global.vrt              # sources relatives tiles/...
 ```
 
-Les sources du VRT sont relatives. Déplacer ou partager **tout le dossier**,
-avec `tiles/`. Pour déplacer aussi un projet, enregistrer son `.qgz` dans ce
-même dossier et choisir les chemins relatifs dans les propriétés du projet.
-Les blocs techniques restent dans `~/qgis_lidar_ign_cache/tiles/`, comme dans le
-script de référence ; ce cache n'est pas nécessaire à la réouverture d'un export
-local. Ne pas supprimer le cache pendant une extraction.
+Le champ **Bibliothèque** désigne directement ce dossier permanent, pas un
+nouveau dossier à chaque extraction. Il est mémorisé par `QSettings` après un
+choix valide ou l'utilisation du chemin saisi. Un dossier vide est autorisé ;
+`tiles/` et `extractions/` sont créés lors de l'extraction. L'interface distingue
+un dossier vide, une bibliothèque déjà structurée et un dossier existant à
+compléter. Les fichiers existants restent en place.
 
-Le **pool commun** est désactivé tant que `POOL_ROOT` dans
-`lidar_hd_2026/config.py` vaut `None`. L'administrateur doit y renseigner le
-**véritable chemin partagé**, avec `Path(...)`, puis reconstruire et réinstaller
-le ZIP ; aucune adresse réseau n'est fournie par défaut. Le dossier partagé doit
-exister et être accessible en lecture et écriture pour tous les utilisateurs.
+Chaque VRT individuel référence **seulement les blocs de l'emprise demandée**,
+tampon compris. Il est le seul raster chargé automatiquement dans QGIS, avec
+Turbo/Updated Canvas. Il ne contient pas toutes les tuiles de la bibliothèque.
+Les tuiles déjà présentes sont prioritaires, puis celles du cache technique ;
+seuls les blocs encore absents sont téléchargés. Les nouvelles tuiles sont
+copiées une fois vers `tiles/`, même si plusieurs extractions les utilisent.
+
+Le VRT global est un contrôle discret de la couverture cumulée. Il inventorie
+les GeoTIFF valides réellement présents dans `tiles/`, indépendamment des VRT
+individuels, et n'est jamais chargé automatiquement. Après chaque extraction,
+sa liste et sa signature de sources sont vérifiées ; l'inventaire validé
+reste dans ses métadonnées, sans fichier annexe. Les tuiles nouvelles ou modifiées
+(taille/date) sont recontrôlées ; le VRT n'est réécrit que si nécessaire. Le bouton
+**Actualiser le VRT global** force le contrôle intégral des GeoTIFF et prend
+en compte les ajouts, retraits ou remplacements manuels, sans polygone requis
+et sans téléchargement. Les fichiers invalides sont ignorés avec un avertissement,
+sans être supprimés. Si aucune tuile valide ne reste, le VRT global périmé est
+retiré ; aucun GeoTIFF n'est effacé.
+
+L'inventaire et la validation du global s'exécutent dans une tâche QGIS,
+annulable, hors du thread graphique. Le contrôle automatique réutilise les
+validations dont la taille et la date n'ont pas changé ; le bouton manuel
+relit tous les pixels, même si ces métadonnées sont inchangées. Les tuiles
+utilisées par une extraction sont toujours validées intégralement. La première
+création du global et sa reconstruction relisent les sources : leur coût
+augmente avec la bibliothèque, surtout sur un partage réseau. Une erreur de
+mise à jour conserve le VRT global précédent et le VRT individuel réussi ;
+elle est signalée dans la barre de messages.
+Une annulation pendant le contrôle global conserve également l'individuel déjà
+enregistré et laisse le dialogue ouvert.
+
+Pour déplacer ou partager les résultats, conserver **toute la bibliothèque**,
+avec `tiles/` et `extractions/`. Copier uniquement un VRT individuel ne suffit
+pas. Un projet `.qgz` enregistré dans la bibliothèque avec des chemins relatifs
+peut être déplacé avec elle. Les blocs techniques restent dans
+`~/qgis_lidar_ign_cache/tiles/`, comme dans le script historique : ce cache évite
+les téléchargements déjà réalisés, même après un changement de bibliothèque.
+Il n'est pas nécessaire pour rouvrir une bibliothèque exportée.
+
+Le changement de bibliothèque locale est libre ; l'interface avertit du risque
+de duplication entre bibliothèques distinctes. Aucune fusion, aucun déplacement
+et aucune suppression automatique ne sont effectués. Les anciennes extractions
+locales `<dossier>/<nom>/tiles/` et celles du pool
+`extractions/<nom>/<nom>.vrt` sont conservées telles quelles. Les noms de leurs
+dossiers sont réservés pour éviter toute ambiguïté avec un nouveau VRT.
+
+Le pool Windows conserve exactement son chemin configuré :
 
 ```text
-<pool>/
-  tiles/                       # GeoTIFF mutualisés
-  extractions/<nom>/<nom>.vrt   # noms uniques, sources ../../tiles/...
+J:\1-milieux-aquatiques-et-risques\0. QGIS\Catalogues des couches\LiDAR HD IGN 2026
 ```
 
-Les blocs déjà disponibles dans le pool évitent l'IGN et la copie. Ceux du cache
-local sont copiés si nécessaire. Les fichiers partagés sont publiés par
-renommage atomique, sous verrous Qt par bloc, avec temporaires uniques. Une tâche
-attend un verrou au maximum 10 minutes, de manière annulable. La réservation du
-dossier d'extraction est exclusive : deux utilisateurs utilisant le même nom
-reçoivent un conflit, sans écrasement. Le plugin ne propose aucune suppression
-des blocs communs. Retirer une couche QGIS ou supprimer son dossier sous
-`extractions/` ne doit jamais entraîner la suppression de `tiles/`.
-Un partage déconnecté produit une erreur explicite. Les sémantiques de verrou et
-de renommage devront être validées sur le véritable partage SMB et sous Windows.
+`POOL_ROOT` dans `lidar_hd_2026/config.py` vaut `None` sur les autres systèmes ;
+le mode est alors désactivé. Le dossier partagé doit être accessible en lecture
+et écriture. Les fichiers sont publiés par remplacement atomique depuis un
+temporaire du même dossier, sous verrous `QLockFile` : un verrou par tuile,
+un par nom d'extraction, et un pour le VRT global. L'ordre bibliothèque puis
+cache empêche deux utilisateurs dotés de caches distincts de télécharger le
+même bloc simultanément. L'attente des verrous est annulable et bornée à dix
+minutes. Les verrous d'extraction et du global ne deviennent pas périmés
+sur la seule durée d'un traitement long. Les noms existants sont revérifiés
+sous verrou avant toute publication.
+
+Aucune tuile mutualisée n'est supprimée par le plugin. Supprimer un VRT ou
+retirer sa couche QGIS ne retire pas ses GeoTIFF. Un partage inaccessible produit
+une erreur explicite. Le comportement des verrous et renommages doit encore
+être validé sur le véritable partage SMB et sous Windows.
+Une suppression manuelle de tuile peut rendre plusieurs VRT individuels
+incomplets ; actualiser le global ne restaure pas les fichiers supprimés.
 
 ## Barre et icône
 
@@ -132,6 +184,8 @@ python3 LiDAR/build_plugin.py --with-sig
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/build_plugin.py --icons
 # Tests PyQGIS/GDAL, données synthétiques, réseau Python interdit :
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s LiDAR/tests -v
+# Mesures locales reproductibles, 100 tuiles synthétiques, résultats sous audits/ :
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/tests/benchmark_library.py
 # Régression de l'intégration graphique SIG-Prestations :
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest plugin.tests.test_package -v
 QT_QPA_PLATFORM=offscreen /usr/bin/python3 plugin/tests/test_qgis_runtime.py
@@ -163,6 +217,7 @@ l'extension intégrée **Processing** active, nécessaire à l'exécution de `--
 Elle est distincte d'une recette humaine. Son résultat est écrit dans
 `audits/lidar-desktop/result.json`. Les tests avec des façades d'énumérations
 3.34 et 3.40 sont **simulés**, pas des exécutions sur ces versions. Consulter
+`audits/LIDAR-PLUGIN-04.md` pour le stockage mutualisé et le VRT global,
 `audits/LIDAR-PLUGIN-03.md` pour la finalisation du dialogue et
 `audits/LIDAR-PLUGIN-02.md` pour les résultats effectifs de la correction IGN,
 de la barre et du dialogue ; `audits/LIDAR-PLUGIN-01.md` décrit

@@ -319,7 +319,7 @@ class PluginTests(unittest.TestCase):
         root = ET.parse(task.vrt)
         filenames = root.findall(".//SourceFilename")
         self.assertEqual(len(filenames), 2)
-        self.assertTrue(all(n.get("relativeToVRT") == "1" and n.text.startswith("tiles/") for n in filenames))
+        self.assertTrue(all(n.get("relativeToVRT") == "1" and n.text.startswith("../tiles/") for n in filenames))
         ds = gdal.Open(str(task.vrt))
         self.assertEqual((ds.RasterXSize, ds.RasterYSize), (2048, 1536))
         self.assertEqual(ds.GetRasterBand(1).ReadAsArray(600, 600, 1, 1)[0,0], -9999)
@@ -331,12 +331,15 @@ class PluginTests(unittest.TestCase):
         self.assertTrue(PROJECT.write(str(task.vrt.parent / "projet.qgz")), PROJECT.error())
         PROJECT.clear(); raster = None
         moved = self.work / "déplacement"
-        shutil.move(task.vrt.parent, moved)
+        shutil.move(self.dest, moved)
         shutil.rmtree(self.cache)
-        self.assertTrue(PROJECT.read(str(moved / "projet.qgz")))
+        self.assertTrue(PROJECT.read(str(moved / "extractions/projet.qgz")))
         restored = next(iter(PROJECT.mapLayers().values()))
         self.assertTrue(restored.isValid())
         self.assertIsInstance(restored.renderer(), QgsSingleBandPseudoColorRenderer)
+        ds=gdal.Open(str(moved/engine.GLOBAL_VRT_NAME)); self.assertIsNotNone(ds)
+        self.assertEqual(ds.GetRasterBand(1).ReadAsArray(0,ds.RasterYSize-1,1,1)[0,0],42)
+        ds=None
 
     def test_cancel_and_resume_keeps_valid_cache(self):
         blocks = ((X, Y), (X + 256, Y))
@@ -396,18 +399,18 @@ class PluginTests(unittest.TestCase):
         pool = self.work / "pool"; pool.mkdir()
         fake_tiff(engine.tile_path(pool,(X,Y)))
         plan = self.plan(mode="pool",root=pool)
-        self.assertEqual((plan.cached,plan.pooled,plan.download_count,plan.estimated_copy),(0,1,0,0))
+        self.assertEqual((plan.cached,plan.available,plan.download_count,plan.estimated_copy),(0,1,0,0))
         task = self.task(plan)
         self.assertTrue(task.run(),task.error)
         self.assertEqual(task.transferred,0)
-        shutil.rmtree(task.vrt.parent)
+        task.vrt.unlink()
         self.assertTrue(engine.check_geotiff(engine.tile_path(pool,(X,Y))))
 
     def test_pool_copies_cache_and_detects_disconnection(self):
         pool = self.work / "pool"; pool.mkdir()
         fake_tiff(engine.tile_path(self.cache,(X,Y)))
         plan = self.plan(mode="pool",root=pool)
-        self.assertEqual((plan.download_count,plan.pooled),(0,0))
+        self.assertEqual((plan.download_count,plan.available),(0,0))
         task = self.task(plan)
         self.assertTrue(task.run(),task.error)
         self.assertGreater(task.copied,0)
@@ -435,6 +438,12 @@ class PluginTests(unittest.TestCase):
         self.assertFalse(list(self.cache.rglob("*.part")))
 
     def test_two_processes_same_cache(self):
+        self._check_two_processes("local")
+
+    def test_two_processes_distinct_caches_same_pool(self):
+        self._check_two_processes("pool")
+
+    def _check_two_processes(self,mode):
         import subprocess
         reference=fake_tiff(self.work/"reference.tif")
         code='''
@@ -443,9 +452,10 @@ from pathlib import Path
 from qgis.PyQt.QtCore import QCoreApplication
 from lidar_hd_2026 import config,engine
 app=QCoreApplication([])
-root,reference,name=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3]
+root,reference,name,mode=Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3],sys.argv[4]
 config.REQUEST_PAUSE_SECONDS=0
-plan=engine.diagnose(((640000,6860032),),root/'cache',root/'sortie',name)
+cache=root/('cache-'+name) if mode=='pool' else root/'cache'
+plan=engine.diagnose(((640000,6860032),),cache,root/'sortie',name,mode)
 (root/('ready-'+name)).touch()
 deadline=time.monotonic()+15
 while len(list(root.glob('ready-*')))<2:
@@ -463,7 +473,7 @@ assert success,task.error
 task.finished(success)
 '''
         env={**os.environ,"PYTHONPATH":str(ROOT/"LiDAR"),"QT_QPA_PLATFORM":"offscreen"}
-        processes=[subprocess.Popen([sys.executable,"-c",code,str(self.work),str(reference),name],
+        processes=[subprocess.Popen([sys.executable,"-c",code,str(self.work),str(reference),name,mode],
                                     cwd=self.work,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                    for name in ("processus1","processus2")]
         try:
@@ -475,7 +485,9 @@ task.finished(success)
                 if process.poll() is None:
                     process.kill(); process.communicate()
         self.assertEqual((self.work/"downloads").read_bytes().splitlines(),[b"IGN simule"])
-        self.assertTrue(engine.check_geotiff(engine.tile_path(self.cache,(X,Y))))
+        self.assertTrue(engine.check_geotiff(engine.tile_path(self.dest,(X,Y))))
+        self.assertEqual(len(list((self.dest/"extractions").glob("*.vrt"))),2)
+        self.assertEqual(len(ET.parse(self.dest/engine.GLOBAL_VRT_NAME).findall(".//SourceFilename")),1)
 
     def test_extraction_reservation_race_does_not_overwrite(self):
         fake_tiff(engine.tile_path(self.cache,(X,Y)))
@@ -485,6 +497,208 @@ task.finished(success)
         before=first.vrt.read_bytes()
         self.assertFalse(second.run())
         self.assertEqual(first.vrt.read_bytes(),before)
+
+    def test_library_reuse_restricted_vrts_and_global_in_both_modes(self):
+        blocks=((X,Y),(X+256,Y))
+        for xy in blocks:
+            fake_tiff(engine.tile_path(self.cache,xy),xy)
+        for mode in ("local","pool"):
+            with self.subTest(mode=mode):
+                root=self.work/mode; root.mkdir()
+                extra=(X+2048,Y)
+                fake_tiff(engine.tile_path(root,extra),extra)
+                first=self.task(self.plan(blocks,name="site_A",mode=mode,root=root))
+                self.assertTrue(first.run(),first.error)
+                global_path=root/engine.GLOBAL_VRT_NAME
+                before=(global_path.read_bytes(),global_path.stat().st_mtime_ns)
+                second=self.task(self.plan((blocks[1],),name="site_B",mode=mode,root=root))
+                self.assertEqual((second.plan.available,second.plan.cached,second.plan.download_count),(1,0,0))
+                with patch.object(engine,"build_vrt",wraps=engine.build_vrt) as build:
+                    self.assertTrue(second.run(),second.error)
+                self.assertEqual(build.call_count,1,"Seul le VRT individuel doit être construit")
+                self.assertEqual((second.transferred,second.copied),(0,0))
+                self.assertEqual((global_path.read_bytes(),global_path.stat().st_mtime_ns),before)
+                self.assertEqual(len(list(root.rglob("*.tif"))),3)
+                self.assertEqual(first.vrt,root/"extractions/site_A.vrt")
+                for vrt,count,prefix in ((first.vrt,2,"../tiles/"),(second.vrt,1,"../tiles/"),(global_path,3,"tiles/")):
+                    nodes=ET.parse(vrt).findall(".//SourceFilename")
+                    self.assertEqual(len(nodes),count)
+                    self.assertTrue(all(n.get("relativeToVRT")=="1" and n.text.startswith(prefix) for n in nodes))
+                self.assertFalse(second.global_result.changed)
+
+    def test_library_prediagnostic_cache_only_and_actual_network(self):
+        blocks=((X,Y),(X+256,Y),(X+512,Y))
+        shared=fake_tiff(engine.tile_path(self.dest,blocks[0]),blocks[0])
+        for xy in blocks[:2]:
+            fake_tiff(engine.tile_path(self.cache,xy),xy)
+        plan=self.plan(blocks)
+        self.assertEqual((plan.available,plan.cached,plan.download_count),(1,1,1))
+        self.assertEqual(plan.estimated_network,shared.stat().st_size)
+        self.assertEqual(plan.estimated_copy,2*shared.stat().st_size)
+        self.assertEqual(len(plan.blocks),3)
+
+    def test_global_manual_add_remove_invalid_files_and_empty_library(self):
+        first=fake_tiff(engine.tile_path(self.dest,(X,Y)))
+        invalid=fake_tiff(self.dest/"tiles/wrong.tif",dtype=gdal.GDT_Int16)
+        xml=self.dest/"tiles/error.tif"; xml.write_bytes(b"<ServiceException/>")
+        result=engine.refresh_global_vrt(self.dest)
+        self.assertEqual((result.count,result.ignored,result.changed),(1,2,True))
+        self.assertFalse(engine.refresh_global_vrt(self.dest).changed)
+        second=fake_tiff(self.dest/"tiles/ajout manuel.tiff",(X+512,Y))
+        result=engine.refresh_global_vrt(self.dest)
+        self.assertEqual((result.count,result.changed),(2,True))
+        first.unlink()
+        self.assertEqual(engine.refresh_global_vrt(self.dest).count,1)
+        second.unlink()
+        result=engine.refresh_global_vrt(self.dest)
+        self.assertEqual((result.vrt,result.count,result.changed),(None,0,True))
+        self.assertFalse((self.dest/engine.GLOBAL_VRT_NAME).exists())
+        self.assertTrue(invalid.exists() and xml.exists(),"Aucune tuile, même invalide, n'est supprimée")
+
+    def test_global_repairs_changed_tile_and_unreadable_vrt(self):
+        path=fake_tiff(engine.tile_path(self.dest,(X,Y)))
+        result=engine.refresh_global_vrt(self.dest)
+        fake_tiff(path,value=95)
+        self.assertTrue(engine.refresh_global_vrt(self.dest).changed)
+        result.vrt.write_bytes(b"VRT interrompu")
+        result=engine.refresh_global_vrt(self.dest)
+        self.assertTrue(result.changed)
+        ds=gdal.Open(str(result.vrt)); self.assertIsNotNone(ds)
+        self.assertEqual(ds.GetRasterBand(1).ReadAsArray(0,0,1,1)[0,0],95)
+        ds=None
+
+    def test_global_inventory_fast_path_and_forced_integrity_check(self):
+        path=fake_tiff(engine.tile_path(self.dest,(X,Y)))
+        result=engine.refresh_global_vrt(self.dest)
+        with patch.object(engine,"geotiff_error",side_effect=AssertionError("Pixels inchangés")):
+            self.assertFalse(engine.refresh_global_vrt(self.dest).changed)
+        with patch.object(engine,"geotiff_error",wraps=engine.geotiff_error) as check:
+            self.assertFalse(engine.refresh_global_vrt(self.dest,force_validation=True).changed)
+        self.assertEqual(check.call_count,1)
+        tree=ET.parse(result.vrt)
+        tree.find("./Metadata[@domain='lidar_hd_2026']/MDI[@key='validated_tiles']").text="inventaire invalide"
+        tree.write(result.vrt)
+        self.assertTrue(engine.refresh_global_vrt(self.dest).changed)
+        # Même sans changement de taille/date, le contrôle manuel reste complet
+        # et une extraction n'accepte jamais un XML à la place d'un TIFF.
+        info=path.stat();path.write_bytes(b"<erreur/>".ljust(info.st_size,b" "))
+        os.utime(path,ns=(info.st_atime_ns,info.st_mtime_ns))
+        self.assertEqual(self.plan().download_count,1)
+        task=engine.GlobalVrtTask(self.dest)
+        self.addCleanup(lambda:engine.TASKS.discard(task))
+        self.assertTrue(task.run(),task.error)
+        self.assertEqual((task.result.count,task.result.ignored),(0,1))
+        self.assertTrue(path.exists())
+
+    def test_global_publish_failure_preserves_individual_and_previous_global(self):
+        fake_tiff(engine.tile_path(self.dest,(X,Y)))
+        global_path=engine.refresh_global_vrt(self.dest).vrt
+        before=global_path.read_bytes()
+        xy=(X+512,Y); fake_tiff(engine.tile_path(self.cache,xy),xy)
+        task=self.task(self.plan((xy,)))
+        replace=Path.replace
+        def fail_global(path,dest):
+            if Path(dest)==global_path:
+                raise OSError("Partage occupé simulé")
+            return replace(path,dest)
+        with patch.object(Path,"replace",fail_global):
+            self.assertTrue(task.run(),task.error)
+        self.assertIn("échec",task.global_error)
+        self.assertEqual(global_path.read_bytes(),before)
+        self.assertTrue(task.vrt.is_file())
+        self.assertFalse(list(self.dest.rglob("*.part")))
+        dialog=self.dialog(); dialog.show(); dialog.task_finished(task,True); QTest.qWait(300)
+        self.assertTrue(dialog.iface.active.isValid())
+        self.assertFalse(dialog.isVisible(),"L'individuel reste une réussite malgré l'avertissement global")
+        self.assertEqual(dialog.iface.messages[-1][1]["level"],Qgis.Warning)
+        self.assertIn("VRT global",str(dialog.iface.messages[-1]))
+        self.assertEqual(len([l for l in PROJECT.mapLayers().values() if isinstance(l,QgsRasterLayer)]),1)
+
+    def test_concurrent_pool_users_with_distinct_caches_and_global_union(self):
+        pool=self.work/"pool"; pool.mkdir()
+        sets=(((X,Y),(X+512,Y)),((X,Y),(X+1024,Y)))
+        tasks=[self.task(engine.diagnose(blocks,self.work/f"cache{i}",pool,f"user{i}","pool"))
+               for i,blocks in enumerate(sets)]
+        calls=[]
+        def download(x,y,dest,canceled):
+            import time
+            calls.append((x,y)); time.sleep(.03)
+            return fake_tiff(dest,(x,y)).stat().st_size
+        with patch.object(engine,"download_block",side_effect=download),ThreadPoolExecutor(2) as executor:
+            result=list(executor.map(lambda task:task.run(),tasks))
+        self.assertEqual(result,[True,True],[t.error for t in tasks])
+        self.assertEqual(sorted(calls),[(X,Y),(X+512,Y),(X+1024,Y)])
+        self.assertEqual(len(list(pool.rglob("*.tif"))),3)
+        self.assertEqual(len(ET.parse(pool/engine.GLOBAL_VRT_NAME).findall(".//SourceFilename")),3)
+        for task in tasks:
+            self.assertEqual(len(ET.parse(task.vrt).findall(".//SourceFilename")),2)
+        self.assertFalse(list(pool.rglob("*.lock")))
+
+    def test_old_extraction_folders_are_preserved_and_names_refused(self):
+        old_local=fake_tiff(self.dest/"ancien_local/tiles/prive.tif")
+        old_pool=self.dest/"extractions/ancien_pool/ancien_pool.vrt"
+        old_pool.parent.mkdir(parents=True); old_pool.write_bytes(b"ancienne extraction")
+        before=(old_local.read_bytes(),old_pool.read_bytes())
+        for name in ("ancien_local","ancien_pool","tiles","extractions","mnt_lidar_global"):
+            with self.subTest(name=name),self.assertRaises(ValueError):
+                self.plan(name=name)
+        fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        task=self.task(self.plan(name="nouvelle")); self.assertTrue(task.run(),task.error)
+        self.assertEqual((old_local.read_bytes(),old_pool.read_bytes()),before)
+        self.assertEqual(len(list((self.dest/"tiles").glob("*.tif"))),1)
+        with self.assertRaises(ValueError): self.plan(name="nouvelle")
+        with self.assertRaisesRegex(ValueError,"distincte du cache"):
+            engine.diagnose(((X,Y),),self.dest,self.dest,"interdit")
+
+    def test_cancel_after_vrt_publish_keeps_tiles_and_allows_resume(self):
+        fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        task=self.task()
+        build=engine.build_vrt
+        def cancel_after_build(*args,**kwargs):
+            build(*args,**kwargs); task.cancel()
+        with patch.object(engine,"build_vrt",side_effect=cancel_after_build):
+            self.assertFalse(task.run())
+        self.assertFalse(task.plan.extraction.exists())
+        self.assertTrue(engine.check_geotiff(engine.tile_path(self.dest,(X,Y))))
+        resumed=self.task(self.plan())
+        self.assertEqual((resumed.plan.available,resumed.plan.download_count),(1,0))
+        self.assertTrue(resumed.run(),resumed.error)
+
+    def test_cancel_during_global_keeps_completed_individual(self):
+        fake_tiff(engine.tile_path(self.cache,(X,Y)))
+        task=self.task()
+        def cancel_global(*args,**kwargs):
+            task.cancel(); raise engine.DownloadCancelled()
+        with patch.object(engine,"refresh_global_vrt",side_effect=cancel_global):
+            self.assertFalse(task.run())
+        self.assertTrue(task.vrt.is_file())
+        dialog=self.dialog(); dialog.show(); dialog.task_finished(task,False); QTest.qWait(250)
+        self.assertTrue(dialog.isVisible())
+        self.assertIn("VRT individuel enregistré",dialog.diagnostic.text())
+
+    def test_library_choice_is_remembered_and_global_update_needs_no_polygons(self):
+        dialog=self.dialog(); dialog.show(); dialog.refresh_diagnostic()
+        self.assertFalse(dialog.extract.isEnabled())
+        self.assertTrue(dialog.global_refresh.isEnabled())
+        self.assertIn("Bibliothèque vide",dialog.library_info.text())
+        fake_tiff(engine.tile_path(self.dest,(X,Y)))
+        dialog.remember_library()
+        self.assertEqual(QSettings().value("lidar_hd_2026/directory"),str(self.dest))
+        dialog.global_refresh.click()
+        loop=QEventLoop(); poll=QTimer()
+        poll.timeout.connect(lambda:loop.quit() if dialog.task is None else None)
+        poll.start(20); QTimer.singleShot(10000,loop.quit); loop.exec_(); poll.stop()
+        self.assertIsNone(dialog.task)
+        self.assertTrue(dialog.isVisible())
+        self.assertIn("1 tuile(s)",dialog.diagnostic.text())
+        self.assertEqual(PROJECT.mapLayers(),{})
+        self.assertTrue((self.dest/engine.GLOBAL_VRT_NAME).is_file())
+        other=self.work/"autre bibliothèque";other.mkdir()
+        dialog.directory.setText(str(other)); dialog.remember_library(); dialog.refresh_diagnostic()
+        self.assertIn("duplication possible",dialog.library_info.text())
+        reopened=LidarDialog(dialog.iface);self.addCleanup(reopened.shutdown)
+        self.assertEqual(reopened.directory.text(),str(other))
+        self.assertTrue(engine.check_geotiff(engine.tile_path(self.dest,(X,Y))))
 
     def test_selection_overlaps_multiple_layers_toggle_right_escape(self):
         a=layer(name="A"); b=layer(name="B")

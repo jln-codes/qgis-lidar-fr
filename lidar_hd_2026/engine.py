@@ -3,15 +3,17 @@
 Les écritures communes sont protégées par QLockFile et publiées par renommage
 atomique depuis un fichier temporaire unique sur le même système de fichiers.
 """
+import hashlib
+import json
 import math
 import os
 import re
-import shutil
 import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -24,6 +26,7 @@ from qgis.PyQt.QtCore import QLockFile
 from . import config
 
 TASKS = set()  # Garder les wrappers Python jusqu'au callback finished().
+GLOBAL_VRT_NAME = "mnt_lidar_global.vrt"
 
 
 class DownloadCancelled(Exception):
@@ -130,10 +133,10 @@ def check_geotiff(path, xy=None):
 
 
 @contextmanager
-def tile_lock(path, is_canceled):
+def tile_lock(path, is_canceled, stale_time_ms=15 * 60 * 1000):
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = QLockFile(str(path) + ".lock")
-    lock.setStaleLockTime(15 * 60 * 1000)
+    lock.setStaleLockTime(stale_time_ms)
     deadline = time.monotonic() + config.LOCK_TIMEOUT_SECONDS
     while not lock.tryLock(0):
         if is_canceled():
@@ -141,7 +144,7 @@ def tile_lock(path, is_canceled):
         if lock.error() != QLockFile.LockFailedError:
             raise OSError(f"Cache ou partage inaccessible, verrou impossible : {path}")
         if time.monotonic() >= deadline:
-            raise OSError(f"Bloc utilisé par une autre instance ; réessayez : {path.name}")
+            raise OSError(f"Fichier utilisé par une autre instance ; réessayez : {path.name}")
         interruptible_pause(0.1, is_canceled)
     try:
         if is_canceled():
@@ -206,27 +209,27 @@ def download_block(xmin, ymin, dest, is_canceled):
         interruptible_pause(config.RETRY_DELAY_SECONDS * 2 ** (attempt - 1), is_canceled)
 
 
-def copy_tile(source, dest, xy, is_canceled):
-    if source == dest:
+def _copy_tile_locked(source, dest, xy, is_canceled):
+    """Publication atomique ; l'appelant possède déjà le verrou de destination."""
+    if check_geotiff(dest, xy):
         return 0
-    with tile_lock(dest, is_canceled):
-        if check_geotiff(dest, xy):
-            return 0
-        with temporary_sibling(dest) as tmp:
-            with source.open("rb") as src, tmp.open("wb") as dst:
-                while True:
-                    if is_canceled():
-                        raise DownloadCancelled()
-                    chunk = src.read(64 * 1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-            error = geotiff_error(tmp, xy)
-            if error is not None:
-                raise RuntimeError(f"Copie invalide : {source} : {error}")
-            size = tmp.stat().st_size
-            tmp.replace(dest)
-            return size
+    with temporary_sibling(dest) as tmp:
+        with source.open("rb") as src, tmp.open("wb") as dst:
+            while True:
+                if is_canceled():
+                    raise DownloadCancelled()
+                chunk = src.read(64 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        error = geotiff_error(tmp, xy)
+        if error is not None:
+            raise RuntimeError(f"Copie invalide : {source} : {error}")
+        if is_canceled():
+            raise DownloadCancelled()
+        size = tmp.stat().st_size
+        tmp.replace(dest)
+        return size
 
 
 def validate_name(name):
@@ -248,10 +251,10 @@ def storage_root(mode, directory, pool_root):
             raise ValueError(f"Pool commun inaccessible ou non inscriptible : {root}")
         return root
     if mode != "local" or not str(directory).strip():
-        raise ValueError("Choisissez un dossier de sortie local.")
+        raise ValueError("Choisissez une bibliothèque LiDAR locale.")
     root = Path(directory).expanduser()
     if not root.is_dir() or not os.access(root, os.R_OK | os.W_OK):
-        raise ValueError(f"Dossier inaccessible ou non inscriptible : {root}")
+        raise ValueError(f"Bibliothèque inaccessible ou non inscriptible : {root}")
     return root
 
 
@@ -263,7 +266,7 @@ class Plan:
     name: str
     mode: str
     cached: int
-    pooled: int
+    available: int
     download_count: int
     estimated_network: int
     estimated_copy: int
@@ -271,45 +274,64 @@ class Plan:
 
     @property
     def extraction(self):
-        return self.root / "extractions" / self.name if self.mode == "pool" else self.root / self.name
+        return self.root / "extractions" / f"{self.name}.vrt"
+
+
+def check_extraction_name(root, name):
+    validate_name(name)
+    if name.casefold() in {"tiles", "extractions", "mnt_lidar_global"}:
+        raise ValueError("Nom réservé à l'organisation de la bibliothèque.")
+    for path in (root / "extractions" / f"{name}.vrt", root / name, root / "extractions" / name):
+        if path.exists() or path.is_symlink():
+            raise ValueError(f"Cette extraction existe déjà (fichier ou ancien dossier) : {path}. Choisissez un autre nom.")
+
+
+def library_status(root):
+    """État local du répertoire, sans création ni inventaire complet des tuiles."""
+    if not any(root.iterdir()):
+        return "Bibliothèque vide : création de tiles/ et extractions/ à la première extraction."
+    for name in ("tiles", "extractions"):
+        path = root / name
+        if path.exists() and not path.is_dir():
+            raise ValueError(f"Structure de bibliothèque incorrecte : {path} doit être un dossier.")
+    if (root / "tiles").is_dir() and (root / "extractions").is_dir():
+        return "Bibliothèque existante : les tuiles sont mutualisées entre extractions."
+    return "Dossier existant : nouvelle structure ajoutée, anciens fichiers conservés sans migration."
 
 
 def diagnose(blocks, cache, root, name, mode="local"):
     """Lecture des seuls blocs demandés ; aucun GetCapabilities ou autre requête."""
-    validate_name(name)
     cache, root = Path(cache).absolute(), Path(root).absolute()
-    cached = pooled = 0
+    check_extraction_name(root, name)
+    library_status(root)
+    if root.resolve() == cache.resolve() or cache.resolve() in root.resolve().parents:
+        raise ValueError("La bibliothèque doit être distincte du cache technique.")
+    blocks = tuple(sorted(set(blocks)))
+    cached = available = 0
     sizes = []
     copy_sizes = []
     copy_unknown = 0
     for xy in blocks:
-        local = tile_path(cache, xy)
-        has_cache = check_geotiff(local, xy)
-        cached += int(has_cache)
         shared = tile_path(root, xy)
-        has_pool = mode == "pool" and check_geotiff(shared, xy)
-        pooled += int(has_pool)
-        source = shared if has_pool else local if has_cache else None
+        has_library = check_geotiff(shared, xy)
+        available += int(has_library)
+        local = tile_path(cache, xy)
+        has_cache = not has_library and check_geotiff(local, xy)
+        cached += int(has_cache)
+        source = shared if has_library else local if has_cache else None
         if source:
             sizes.append(source.stat().st_size)
-        if not has_pool:
+        if not has_library:
             if has_cache:
                 copy_sizes.append(local.stat().st_size)
             else:
                 copy_unknown += 1
     mean = max(1, round(sum(sizes) / len(sizes))) if sizes else 1024 ** 2
-    # Le cache et le pool peuvent se recouvrir : compter l'union disponible.
-    missing = sum(not check_geotiff(tile_path(cache, xy), xy)
-                  and not (mode == "pool" and check_geotiff(tile_path(root, xy), xy)) for xy in blocks)
-    plan = Plan(tuple(blocks), cache, root, name, mode, cached, pooled, missing,
+    missing = len(blocks) - available - cached
+    plan = Plan(blocks, cache, root, name, mode, cached, available, missing,
                 missing * mean, sum(copy_sizes) + copy_unknown * mean, mean)
     if not blocks:
         raise ValueError("Aucun bloc nécessaire.")
-    if plan.extraction.exists():
-        raise ValueError(f"Cette extraction existe déjà : {plan.extraction}. Choisissez un autre nom.")
-    # Éviter de confondre le dossier exporté et les blocs techniques/communs.
-    if plan.extraction == cache or plan.extraction == cache / "tiles":
-        raise ValueError("La destination entre en conflit avec le cache technique.")
     return plan
 
 
@@ -354,6 +376,142 @@ def build_vrt(dest, paths, blocks):
         tmp.replace(dest)
 
 
+@dataclass(frozen=True)
+class GlobalVrtResult:
+    vrt: Optional[Path]
+    changed: bool
+    count: int
+    ignored: int
+
+
+def refresh_global_vrt(root, is_canceled=lambda: False, progress=None, force_validation=False):
+    """Inventaire réel sous verrou ; aucune couche QGIS, aucune requête IGN.
+
+    La signature reste dans le VRT : pas d'index externe à déplacer avec lui.
+    L'inventaire validé et ses métadonnées évitent de relire les pixels des
+    sources inchangées. Le contrôle manuel force leur validation complète.
+    """
+    root = storage_root("local", root, None).absolute()
+    dest = root / GLOBAL_VRT_NAME
+    with tile_lock(dest, is_canceled, stale_time_ms=0):
+        validated = {}
+        if not force_validation:
+            try:
+                previous = ET.parse(dest)
+                records = json.loads(previous.findtext(
+                    "./Metadata[@domain='lidar_hd_2026']/MDI[@key='validated_tiles']"))
+                digest = hashlib.sha256(json.dumps(records).encode("utf-8")).hexdigest()
+                if digest == previous.findtext("./Metadata[@domain='lidar_hd_2026']/MDI[@key='sources']"):
+                    validated = {r[0]: r for r in records if len(r) == 5
+                                 and isinstance(r[0], str)
+                                 and all(isinstance(v, (int, float)) and math.isfinite(v) for v in r[1:])}
+            except (ET.ParseError, OSError, TypeError, ValueError, OverflowError):
+                pass  # Aucun inventaire réutilisable : contrôle complet.
+        folder = root / "tiles"
+        files = sorted((p for p in folder.iterdir()
+                        if p.is_file() and p.suffix.lower() in {".tif", ".tiff"}),
+                       key=lambda p: p.name) if folder.exists() else []
+        paths, blocks, states = [], [], []
+        ignored = 0
+        for index, path in enumerate(files):
+            if is_canceled():
+                raise DownloadCancelled()
+            info = path.stat()
+            state = [path.name, info.st_size, info.st_mtime_ns]
+            previous = validated.get(path.name)
+            if previous is not None and previous[:3] == state:
+                xy = previous[3:]
+            elif geotiff_error(path) is not None:
+                ignored += 1
+                xy = None
+            else:
+                ds = gdal.Open(str(path), gdal.GA_ReadOnly)
+                if ds is None:
+                    raise RuntimeError(f"Tuile devenue illisible pendant l'inventaire : {path}")
+                gt = ds.GetGeoTransform()
+                ds = None
+                after = path.stat()
+                if (after.st_size, after.st_mtime_ns) != (info.st_size, info.st_mtime_ns):
+                    raise RuntimeError(f"Tuile modifiée pendant l'inventaire : {path}")
+                xy = (gt[0], gt[3] - config.BLOCK_M)
+            if xy is not None:
+                paths.append(path)
+                blocks.append(xy)
+                states.append(state + list(xy))
+            if progress is not None:
+                progress(90 * (index + 1) / len(files))
+        if is_canceled():
+            raise DownloadCancelled()
+        if not paths:
+            changed = dest.exists()
+            # Une bibliothèque devenue vide ne doit pas garder un VRT périmé.
+            dest.unlink(missing_ok=True)
+            return GlobalVrtResult(None, changed, 0, ignored)
+        signature = hashlib.sha256(json.dumps(states).encode("utf-8")).hexdigest()
+        try:
+            tree = ET.parse(dest)
+            old_signature = tree.findtext("./Metadata[@domain='lidar_hd_2026']/MDI[@key='sources']")
+            same_inventory = json.loads(tree.findtext(
+                "./Metadata[@domain='lidar_hd_2026']/MDI[@key='validated_tiles']")) == states
+            sources = tree.findall(".//SourceFilename")
+            expected = {f"tiles/{p.name}" for p in paths}
+            same_sources = (len(sources) == len(paths)
+                            and all(n.get("relativeToVRT") == "1" for n in sources)
+                            and {n.text for n in sources} == expected)
+            gdal.PushErrorHandler("CPLQuietErrorHandler")
+            try:
+                ds = gdal.Open(str(dest), gdal.GA_ReadOnly)
+                readable = ds is not None
+                ds = None
+            finally:
+                gdal.PopErrorHandler()
+            if signature == old_signature and same_inventory and same_sources and readable:
+                return GlobalVrtResult(dest, False, len(paths), ignored)
+        except (ET.ParseError, OSError, RuntimeError, TypeError, ValueError):
+            pass  # Absent ou illisible : reconstruire depuis les seules tuiles.
+        with temporary_sibling(dest) as tmp:
+            build_vrt(tmp, paths, blocks)
+            tree = ET.parse(tmp)
+            metadata = ET.SubElement(tree.getroot(), "Metadata", domain="lidar_hd_2026")
+            ET.SubElement(metadata, "MDI", key="sources").text = signature
+            ET.SubElement(metadata, "MDI", key="validated_tiles").text = json.dumps(states)
+            tree.write(tmp, encoding="utf-8", xml_declaration=True)
+            if is_canceled():
+                raise DownloadCancelled()
+            tmp.replace(dest)
+        return GlobalVrtResult(dest, True, len(paths), ignored)
+
+
+class GlobalVrtTask(QgsTask):
+    """Régénération manuelle de la couverture, sans extraction ni chargement."""
+    def __init__(self, root, callback=None):
+        super().__init__("LiDAR HD 2026 — couverture globale", QgsTask.CanCancel)
+        self.root = root
+        self.callback = callback
+        self.result = None
+        self.error = None
+        TASKS.add(self)
+
+    def run(self):
+        try:
+            self.result = refresh_global_vrt(self.root, self.isCanceled, self.setProgress, force_validation=True)
+            self.setProgress(100)
+            return True
+        except DownloadCancelled:
+            return False
+        except Exception as error:
+            self.error = str(error)
+            return False
+
+    def finished(self, success):
+        try:
+            if self.callback is not None:
+                self.callback(self, success)
+        finally:
+            self.callback = None
+            TASKS.discard(self)
+
+
 class LidarDownloadTask(QgsTask):
     """run() : fichiers et réseau uniquement ; finished() : rappel sur le thread GUI."""
     def __init__(self, plan, callback=None):
@@ -365,58 +523,59 @@ class LidarDownloadTask(QgsTask):
         self.transferred = 0
         self.copied = 0
         self.vrt = None
+        self.global_result = None
+        self.global_error = None
         TASKS.add(self)
 
     def run(self):
         plan = self.plan
-        available = []
-        created = False
         try:
             # Revérifier le partage au début : ne pas le recréer si déconnecté.
             storage_root(plan.mode, plan.root, plan.root if plan.mode == "pool" else None)
-            for i, xy in enumerate(plan.blocks):
+            with tile_lock(plan.extraction, self.isCanceled, stale_time_ms=0):
+                check_extraction_name(plan.root, plan.name)
+                available = []
+                for i, xy in enumerate(plan.blocks):
+                    if self.isCanceled():
+                        raise DownloadCancelled()
+                    cached = tile_path(plan.cache, xy)
+                    shared = tile_path(plan.root, xy)
+                    try:
+                        if not check_geotiff(shared, xy):
+                            # Bibliothèque puis cache : ordre identique partout.
+                            # Deux utilisateurs avec des caches distincts ne
+                            # téléchargent pas le même bloc en parallèle.
+                            with tile_lock(shared, self.isCanceled):
+                                if not check_geotiff(shared, xy):
+                                    with tile_lock(cached, self.isCanceled):
+                                        if not check_geotiff(cached, xy):
+                                            self.transferred += download_block(*xy, cached, self.isCanceled)
+                                            interruptible_pause(config.REQUEST_PAUSE_SECONDS, self.isCanceled)
+                                    self.copied += _copy_tile_locked(cached, shared, xy, self.isCanceled)
+                        available.append((xy, shared))
+                    except DownloadCancelled:
+                        raise
+                    except Exception as error:
+                        self.failed.append((xy, str(error)))
+                    self.setProgress(90 * (i + 1) / len(plan.blocks))
                 if self.isCanceled():
                     raise DownloadCancelled()
-                cached = tile_path(plan.cache, xy)
-                pooled = tile_path(plan.root, xy) if plan.mode == "pool" else None
-                try:
-                    if pooled and check_geotiff(pooled, xy):
-                        source = pooled
-                    else:
-                        with tile_lock(cached, self.isCanceled):
-                            if not check_geotiff(cached, xy):
-                                self.transferred += download_block(*xy, cached, self.isCanceled)
-                                interruptible_pause(config.REQUEST_PAUSE_SECONDS, self.isCanceled)
-                        source = cached
-                        if pooled:
-                            self.copied += copy_tile(cached, pooled, xy, self.isCanceled)
-                            source = pooled
-                    available.append((xy, source))
-                except DownloadCancelled:
-                    raise
-                except Exception as error:
-                    self.failed.append((xy, str(error)))
-                self.setProgress(90 * (i + 1) / len(plan.blocks))
-            if self.isCanceled():
-                raise DownloadCancelled()
-            if not available:
-                raise RuntimeError("Aucun GeoTIFF disponible. " + "; ".join(reason for _, reason in self.failed[:3]))
-            # mkdir exclusif : deux extractions homonymes ne s'écrasent jamais.
-            plan.extraction.parent.mkdir(parents=True, exist_ok=True)
-            plan.extraction.mkdir()
-            created = True
-            paths = []
-            for xy, source in available:
+                if not available:
+                    raise RuntimeError("Aucun GeoTIFF disponible. " + "; ".join(reason for _, reason in self.failed[:3]))
+                # Nouvelle vérification après l'attente, sans toucher aux anciens dossiers.
+                check_extraction_name(plan.root, plan.name)
+                build_vrt(plan.extraction, [p for _, p in available], [xy for xy, _ in available])
                 if self.isCanceled():
+                    plan.extraction.unlink()  # Seulement le VRT que cette tâche vient de publier.
                     raise DownloadCancelled()
-                dest = tile_path(plan.extraction, xy) if plan.mode == "local" else source
-                self.copied += copy_tile(source, dest, xy, self.isCanceled)
-                paths.append(dest)
-            dest = plan.extraction / f"{plan.name}.vrt"
-            build_vrt(dest, paths, [xy for xy, _ in available])
-            if self.isCanceled():
-                raise DownloadCancelled()
-            self.vrt = dest
+                self.vrt = plan.extraction
+            try:
+                self.global_result = refresh_global_vrt(plan.root, self.isCanceled)
+            except DownloadCancelled:
+                self.global_error = "Actualisation du VRT global annulée ; VRT individuel conservé."
+                return False
+            except Exception as error:
+                self.global_error = f"VRT individuel enregistré ; échec de mise à jour du VRT global : {error}"
             self.setProgress(100)
             return True
         except DownloadCancelled:
@@ -424,11 +583,6 @@ class LidarDownloadTask(QgsTask):
         except Exception as error:
             self.error = str(error)
             return False
-        finally:
-            # Seulement le dossier exclusif créé par cette tâche. Les blocs
-            # du cache et du pool ne sont jamais supprimés.
-            if created and self.vrt is None:
-                shutil.rmtree(plan.extraction, ignore_errors=True)
 
     def finished(self, success):
         try:

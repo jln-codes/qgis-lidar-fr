@@ -13,7 +13,8 @@ from qgis.PyQt.QtWidgets import (QComboBox, QDialog, QDoubleSpinBox, QFileDialog
                                 QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from . import config
-from .engine import LidarDownloadTask, diagnose, storage_root, tile_path
+from .engine import (GlobalVrtTask, LidarDownloadTask, diagnose, library_status,
+                     storage_root, tile_path)
 from .rendering import create_altitude_renderer
 from .selection import PolygonSelectionTool
 from .spatial import is_polygon, snapshot
@@ -85,12 +86,12 @@ class LidarDialog(QDialog):
                                "après transformation des polygones en EPSG:2154.")
         footprint_form.addRow("Tampon", self.buffer)
         self.name = QLineEdit("mnt_lidar_hd", self)
-        self.name.setToolTip("Nom du dossier et du VRT. Une extraction existante ne sera jamais écrasée.")
+        self.name.setToolTip("Nom du VRT individuel dans extractions/. Aucun fichier ou ancien dossier homonyme n'est écrasé.")
         output_form.addRow("Nom", self.name)
         self.storage = QComboBox(self)
         self.storage.addItem("Disque local", "local")
         self.storage.addItem("Pool commun" if config.POOL_ROOT is not None else "Pool non configuré", "pool")
-        self.storage.setToolTip("Disque local recommandé : dossier autonome avec VRT et GeoTIFF. "
+        self.storage.setToolTip("Bibliothèque permanente : tiles/, extractions/ et mnt_lidar_global.vrt. "
                                + ("Pool désactivé : emplacement partagé non configuré."
                                   if config.POOL_ROOT is None else f"Pool partagé : {config.POOL_ROOT}"))
         if config.POOL_ROOT is None:
@@ -100,11 +101,22 @@ class LidarDialog(QDialog):
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
         self.directory = QLineEdit(QSettings().value("lidar_hd_2026/directory", "", type=str), self)
-        self.directory.setToolTip("Dossier existant où sera créé le sous-dossier portant le nom de l'extraction.")
+        self.session_library = self.directory.text()
+        self.directory.setPlaceholderText("LiDAR HD IGN 2026")
+        self.directory.setToolTip("Bibliothèque LiDAR permanente, mémorisée pour les prochaines utilisations. "
+                                  "Choisir le même dossier pour réutiliser ses tuiles. "
+                                  "Déplacer ou partager la bibliothèque complète, avec tiles/ et extractions/.")
         self.browse = QPushButton("Parcourir…", self)
         row_layout.addWidget(self.directory)
         row_layout.addWidget(self.browse)
-        output_form.addRow("Dossier", row)
+        output_form.addRow("Bibliothèque", row)
+        self.library_info = QLabel(self)
+        self.library_info.setWordWrap(True)
+        output_form.addRow("", self.library_info)
+        self.global_refresh = QPushButton("Actualiser le VRT global", self)
+        self.global_refresh.setToolTip("Recontrôler le contenu réel de tiles/ après un ajout ou retrait manuel. "
+                                       "Ne télécharge rien et ne charge pas ce VRT dans QGIS.")
+        output_form.addRow("", self.global_refresh)
         content_layout.addWidget(self.parameters)
         diagnostic_box = QGroupBox("Prédiagnostic", content)
         diagnostic_layout = QVBoxLayout(diagnostic_box)
@@ -150,6 +162,8 @@ class LidarDialog(QDialog):
             signal.connect(self.schedule_diagnostic)
         self.select_button.clicked.connect(self.start_capture)
         self.browse.clicked.connect(self.choose_directory)
+        self.directory.editingFinished.connect(self.remember_library)
+        self.global_refresh.clicked.connect(self.start_global_refresh)
         self.extract.clicked.connect(self.start_extraction)
         self.cancel.clicked.connect(self.cancel_task)
         close.clicked.connect(self.close)
@@ -219,9 +233,19 @@ class LidarDialog(QDialog):
             self.timer.start()
 
     def choose_directory(self):
-        path = QFileDialog.getExistingDirectory(self, "Dossier des extractions LiDAR", self.directory.text())
+        path = QFileDialog.getExistingDirectory(self, "Bibliothèque LiDAR permanente", self.directory.text())
         if path:
             self.directory.setText(path)
+            self.remember_library()
+
+    def remember_library(self):
+        if self.storage.currentData() == "local":
+            try:
+                root = storage_root("local", self.directory.text(), None)
+                library_status(root)
+            except (ValueError, OSError):
+                return
+            QSettings().setValue("lidar_hd_2026/directory", str(root))
 
     def selected_sources(self):
         if self.mode.currentIndex() == 0:
@@ -242,25 +266,37 @@ class LidarDialog(QDialog):
         self.selection_label.setVisible(cartographic)
         self.directory.setEnabled(self.storage.currentData() == "local")
         self.browse.setEnabled(self.storage.currentData() == "local")
+        self.global_refresh.setEnabled(False)
         if self.task is not None:
             return
         try:
-            footprint = snapshot(self.selected_sources(), self.buffer.value())
             mode = self.storage.currentData()
             root = storage_root(mode, self.directory.text(), config.POOL_ROOT)
+            status = library_status(root)
+            if mode == "local" and self.directory.text() != self.session_library:
+                status += " Bibliothèque distincte : duplication possible ; aucune fusion automatique."
+            self.library_info.setText(status)
+            self.global_refresh.setEnabled(True)
+        except Exception as error:
+            self.library_info.setText(str(error))
+            self.diagnostic.setText(str(error))
+            self.fit_timer.start(0)
+            return
+        try:
+            footprint = snapshot(self.selected_sources(), self.buffer.value())
             plan = diagnose(footprint.blocks, config.CACHE_DIR, root, self.name.text(), mode)
             self.diagnostic.setText(
                 f"Prédiagnostic sans réseau\n"
                 f"Entités : {footprint.features} ; parties polygonales : {footprint.parts}\n"
                 f"Surface après tampon (approx.) : {footprint.area_m2 / 10000:.2f} ha\n"
-                f"Blocs nécessaires : {len(plan.blocks)} ; valides en cache : {plan.cached}"
-                + (f" ; disponibles dans le pool : {plan.pooled}" if mode == "pool" else "")
-                + f"\nBlocs à télécharger : {plan.download_count}\n"
+                f"Blocs nécessaires : {len(plan.blocks)} ; dans la bibliothèque : {plan.available}\n"
+                f"Disponibles seulement dans le cache technique : {plan.cached}\n"
+                f"Blocs à télécharger depuis l'IGN : {plan.download_count}\n"
                 f"Transfert IGN estimé : {plan.estimated_network / 1024**2:.2f} Mio\n"
-                f"Copie vers {'le pool' if mode == 'pool' else 'le dossier local'} : "
+                f"Nouvelles données dans la bibliothèque : "
                 f"{plan.estimated_copy / 1024**2:.2f} Mio (approx.)\n"
                 f"Estimation par bloc : {plan.mean_bytes / 1024**2:.2f} Mio\n"
-                f"Destination : {plan.extraction / (plan.name + '.vrt')}")
+                f"VRT individuel : {plan.extraction}")
             self.plan = plan
             self.extract.setEnabled(True)
         except Exception as error:
@@ -315,8 +351,25 @@ class LidarDialog(QDialog):
         self.refresh_diagnostic()
         if self.plan is None or self.task is not None:
             return
-        QSettings().setValue("lidar_hd_2026/directory", self.directory.text())
-        self.task = LidarDownloadTask(self.plan, self.task_finished)
+        self.remember_library()
+        self.launch_task(LidarDownloadTask(self.plan, self.task_finished))
+
+    def start_global_refresh(self):
+        if self.task is not None:
+            return
+        self.completion_timer.stop()
+        try:
+            root = storage_root(self.storage.currentData(), self.directory.text(), config.POOL_ROOT)
+            library_status(root)
+            self.remember_library()
+            self.launch_task(GlobalVrtTask(root, self.global_finished))
+            self.diagnostic.setText("Contrôle de la bibliothèque et actualisation du VRT global, sans téléchargement…")
+        except Exception as error:
+            self.diagnostic.setText(str(error))
+            self.capture_message(str(error))
+
+    def launch_task(self, task):
+        self.task = task
         self.task.progressChanged.connect(self.task_progress)
         self.parameters.setEnabled(False)
         self.extract.setEnabled(False)
@@ -331,7 +384,28 @@ class LidarDialog(QDialog):
         if self.task is not None:
             self.task.cancel()
             self.cancel.setEnabled(False)
-            self.diagnostic.setText("Annulation demandée ; les blocs validés restent en cache pour la reprise.")
+            self.diagnostic.setText("Annulation demandée ; les tuiles du cache et de la bibliothèque sont conservées.")
+
+    def global_finished(self, task, success):
+        self.task = None
+        self.parameters.setEnabled(True)
+        self.cancel.setEnabled(False)
+        self.refresh_diagnostic()
+        if task.isCanceled():
+            message, level = "Actualisation du VRT global annulée ; aucun GeoTIFF supprimé.", Qgis.Warning
+        elif not success or task.result is None:
+            message, level = f"Échec du VRT global : {task.error}", Qgis.Warning
+        else:
+            result = task.result
+            state = "actualisé" if result.changed else "inchangé"
+            message = (f"VRT global {state} : {result.count} tuile(s) valide(s), "
+                       f"{result.ignored} fichier(s) invalide(s) ignoré(s).\n"
+                       + (str(result.vrt) if result.vrt else "Aucune tuile valide ; aucun VRT global conservé."))
+            level = Qgis.Warning if result.ignored else Qgis.Success
+        self.diagnostic.setText(message)
+        self.iface.messageBar().pushMessage("LiDAR HD 2026", message, level=level, duration=15)
+        self.timer.stop()
+        self.fit_timer.start(0)
 
     def task_finished(self, task, success):
         self.completion_timer.stop()
@@ -341,7 +415,8 @@ class LidarDialog(QDialog):
         self.refresh_diagnostic()
         try:
             if task.isCanceled():
-                message = "Extraction annulée ; relancez pour reprendre depuis le cache."
+                message = (f"VRT individuel enregistré : {task.vrt}. Actualisation globale annulée."
+                           if task.vrt else "Extraction annulée ; relancez pour reprendre depuis le cache et la bibliothèque.")
                 self.diagnostic.setText(message)
                 self.capture_message(message)
                 return
@@ -388,9 +463,14 @@ class LidarDialog(QDialog):
                 message += "\n".join(f"{xy} : {reason}" for xy, reason in task.failed[:5])
             if style_error:
                 message += "\n" + style_error
+            global_warning = task.global_error
+            if task.global_result and task.global_result.ignored:
+                global_warning = (f"Couverture globale : {task.global_result.ignored} fichier(s) invalide(s) ignoré(s).")
+            if global_warning:
+                message += "\n" + global_warning
             self.diagnostic.setText(message)
             self.iface.messageBar().pushMessage("LiDAR HD 2026", message,
-                                               level=Qgis.Warning if incomplete or style_error else Qgis.Success,
+                                               level=Qgis.Warning if incomplete or style_error or global_warning else Qgis.Success,
                                                duration=15)
             if not incomplete and style_error is None:
                 self.completion_timer.start(0)

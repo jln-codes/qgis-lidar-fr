@@ -157,7 +157,8 @@ def start():
     lidar.action.trigger()
     dialog = lidar.dialog
     dialog.buffer.setValue(0)
-    dialog.directory.setText(str(WORK_PATH))
+    library=WORK_PATH/"LiDAR HD IGN 2026";library.mkdir()
+    dialog.directory.setText(str(library))
     dialog.name.setText("desktop_relief")
     dialog.mode.setCurrentIndex(1)
     dialog.refresh_diagnostic()
@@ -193,6 +194,16 @@ def wait_for_task(plugin, sources):
     assert raster.renderer().minMaxOrigin().extent() == Qgis.RasterRangeExtent.UpdatedCanvas
     path = Path(raster.source())
     assert all(n.get("relativeToVRT") == "1" for n in ET.parse(path).findall(".//SourceFilename"))
+    assert path.parent.name == "extractions"
+    assert all(n.text.startswith("../tiles/") for n in ET.parse(path).findall(".//SourceFilename"))
+    global_vrt=path.parent.parent/"mnt_lidar_global.vrt"
+    assert global_vrt.is_file()
+    assert all(n.get("relativeToVRT")=="1" and n.text.startswith("tiles/")
+               for n in ET.parse(global_vrt).findall(".//SourceFilename"))
+    assert len(ET.parse(global_vrt).findall(".//SourceFilename"))==2
+    assert not any(isinstance(l,QgsRasterLayer) and Path(l.source())==global_vrt
+                   for l in QgsProject.instance().mapLayers().values())
+    RESULT["library_global_not_loaded"] = True
     RESULT["extract_task_turbo"] = True
     record("extraction et Turbo validés")
     assert not plugin.dialog.isVisible(), plugin.dialog.diagnostic.text()
