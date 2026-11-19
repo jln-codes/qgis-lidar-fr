@@ -164,4 +164,19 @@ fast-forward : examiner la divergence avant de poursuivre.
 
 ## Publication
 
-À compléter après vérification du push et du clone propre.
+La publication normale de `main` est vérifiée sur GitHub au commit technique
+`327a4ed2cd05f1381abdf8ecc3f8bcb2a2517fb8`. Un clone neuf du dépôt distant
+reconstruit le ZIP et passe le test d’installation isolée ; son archive est
+strictement identique, SHA-256 :
+`7486e62b4d6e74f4da8d055088d098829338d32f6d1ade27fca17ea7c3518fd2`.
+
+Après ce contrôle, le retrait dans GEMAPI-App est publié par le commit
+`04d697ce87d409c2d87acfaec4a6e076022683d1`, sur `development` puis `main`.
+Le ZIP standard est reconstruit et testé sans LiDAR ; un clone neuf de GEMAPI-App
+reproduit aussi son archive. Le worktree adjacent `gemapi-app-sirs` est créé
+à partir de cette version nettoyée, sans nouvelle fonctionnalité SIRS.
+
+Les anciennes installations QGIS locales sont sauvegardées séparément ; le profil
+Ubuntu reçoit `sig_prestations` 0.8.0 et `lidar_hd_2026` 0.1.3. L’installation
+expérimentale distincte est retirée. Les connexions PostgreSQL restent inchangées.
+La validation Windows native reste réservée.
