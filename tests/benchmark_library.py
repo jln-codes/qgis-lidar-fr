@@ -1,12 +1,12 @@
 """Mesure hors réseau : 100 tuiles synthétiques, extractions limitées à deux.
 
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/tests/benchmark_library.py
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 tests/benchmark_library.py
 Le répertoire de résultats facultatif est le premier argument ; par défaut audits/.
 Aucune donnée utilisateur n'est lue ; les GeoTIFF temporaires sont nettoyés.
 """
 import json,sys,tempfile,time,statistics
 from pathlib import Path
-root=Path(__file__).resolve().parents[2];sys.path[:0]=[str(root/'LiDAR/tests'),str(root/'LiDAR')]
+root=Path(__file__).resolve().parents[1];sys.path[:0]=[str(root/'tests'),str(root)]
 from test_plugin import APP,fake_tiff,X,Y
 from lidar_hd_2026 import engine,rendering
 from qgis.core import Qgis,QgsRasterLayer,QgsMapSettings,QgsMapRendererSequentialJob

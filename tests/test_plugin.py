@@ -1,6 +1,6 @@
 """Tests hors réseau avec PyQGIS réel et GeoTIFF synthétiques (aucune donnée métier).
 
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s LiDAR/tests -v
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s tests -v
 """
 import importlib.util
 import io
@@ -29,10 +29,10 @@ from qgis.PyQt.QtCore import QEventLoop, QPoint, QSize, QSettings, QThread, QTim
 from qgis.PyQt.QtGui import QColor, QImage, QPainter
 from qgis.PyQt.QtSvg import QSvgRenderer
 from qgis.PyQt.QtTest import QTest
-from qgis.PyQt.QtWidgets import QGridLayout, QGroupBox, QMainWindow, QToolBar
+from qgis.PyQt.QtWidgets import QAction, QGridLayout, QGroupBox, QMainWindow, QToolBar
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path[:0] = [str(ROOT / "LiDAR"), str(ROOT / "plugin")]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 from lidar_hd_2026 import classFactory
 from lidar_hd_2026 import config, engine, rendering
 from lidar_hd_2026.dialog import LidarDialog
@@ -472,7 +472,7 @@ success=task.run()
 assert success,task.error
 task.finished(success)
 '''
-        env={**os.environ,"PYTHONPATH":str(ROOT/"LiDAR"),"QT_QPA_PLATFORM":"offscreen"}
+        env={**os.environ,"PYTHONPATH":str(ROOT),"QT_QPA_PLATFORM":"offscreen"}
         processes=[subprocess.Popen([sys.executable,"-c",code,str(self.work),str(reference),name,mode],
                                     cwd=self.work,env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
                    for name in ("processus1","processus2")]
@@ -889,48 +889,46 @@ task.finished(success)
                 plugin.unload()
                 self.assertEqual(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar"),[])
 
-    @unittest.skipIf(Qgis.QGIS_VERSION_INT < 34400,"SIG-Prestations exige QGIS 3.44 ; LiDAR seul est testé sur cette version")
-    def test_toolbar_both_plugins_order_unload_reload(self):
-        from sig_prestations import classFactory as sigFactory
-        for order in ((classFactory,sigFactory),(sigFactory,classFactory)):
-            for unload_first in (0,1):
-                with self.subTest(order=order,unload_first=unload_first):
-                    iface=self.iface()
-                    iface.window.show()
-                    plugins=[factory(iface) for factory in order]
-                    for plugin in plugins:
-                        plugin.initGui(); plugin.initGui()
-                    bars=iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")
-                    self.assertEqual(len(bars),1)
-                    self.assertEqual(len(bars[0].actions()),2)
-                    self.assertTrue(bars[0].isVisible())
-                    self.assertEqual(bars[0].toolButtonStyle(),Qt.ToolButtonIconOnly)
-                    plugins[unload_first].unload()
-                    self.assertEqual(len(bars[0].actions()),1)
-                    self.assertIs(plugins[1-unload_first].toolbar,bars[0])
-                    plugins[1-unload_first].unload()
+    def test_toolbar_peer_order_unload_reload(self):
+        # Independent peer action: no installation or import of another extension.
+        for peer_first in (True, False):
+            for unload_lidar_first in (True, False):
+                with self.subTest(peer_first=peer_first, unload_lidar_first=unload_lidar_first):
+                    iface=self.iface(); iface.window.show()
+                    plugin=classFactory(iface)
+                    if peer_first:
+                        bar=QToolBar("SIG-Milieux",iface.window)
+                        bar.setObjectName("SIGMilieuxToolbar"); iface.window.addToolBar(bar)
+                    else:
+                        plugin.initGui(); bar=plugin.toolbar
+                    peer=QAction("Independent plugin",iface.window); bar.addAction(peer)
+                    plugin.initGui(); plugin.initGui()
+                    self.assertIs(plugin.toolbar,bar)
+                    self.assertEqual(len(bar.actions()),2)
+                    self.assertEqual(len(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")),1)
+                    if unload_lidar_first:
+                        plugin.unload()
+                        self.assertEqual(bar.actions(),[peer])
+                        self.assertIs(iface.window.findChild(QToolBar,"SIGMilieuxToolbar"),bar)
+                        plugin=classFactory(iface); plugin.initGui()
+                        self.assertEqual(len(bar.actions()),2)
+                    bar.removeAction(peer); peer.deleteLater()
+                    self.assertEqual(bar.actions(),[plugin.action])
+                    plugin.unload(); plugin.unload()
                     self.assertEqual(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar"),[])
-                    reloaded=classFactory(iface); reloaded.initGui()
-                    self.assertEqual(len(reloaded.toolbar.actions()),1)
-                    reloaded.unload(); self.assertEqual(iface.menus,[])
 
     def test_toolbar_hidden_state_and_text_style_are_restored(self):
-        factories=[classFactory]
-        if Qgis.QGIS_VERSION_INT >= 34400:
-            from sig_prestations import classFactory as sigFactory
-            factories.append(sigFactory)
-        for factory in factories:
-            iface=self.iface(); iface.window.show()
-            bar=QToolBar("SIG-Milieux",iface.window);bar.setObjectName("SIGMilieuxToolbar")
-            iface.window.addToolBar(bar);bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);bar.hide()
-            plugin=factory(iface)
-            plugin.initGui(); APP.processEvents()
-            self.assertIs(plugin.toolbar,bar)
-            self.assertTrue(bar.isVisible())
-            self.assertTrue(bar.widgetForAction(plugin.action).isVisible())
-            self.assertEqual(bar.widgetForAction(plugin.action).toolButtonStyle(),Qt.ToolButtonIconOnly)
-            self.assertEqual(len(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")),1)
-            plugin.unload()
+        iface=self.iface(); iface.window.show()
+        bar=QToolBar("SIG-Milieux",iface.window);bar.setObjectName("SIGMilieuxToolbar")
+        iface.window.addToolBar(bar);bar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon);bar.hide()
+        plugin=classFactory(iface)
+        plugin.initGui(); APP.processEvents()
+        self.assertIs(plugin.toolbar,bar)
+        self.assertTrue(bar.isVisible())
+        self.assertTrue(bar.widgetForAction(plugin.action).isVisible())
+        self.assertEqual(bar.widgetForAction(plugin.action).toolButtonStyle(),Qt.ToolButtonIconOnly)
+        self.assertEqual(len(iface.window.findChildren(QToolBar,"SIGMilieuxToolbar")),1)
+        plugin.unload()
 
     def test_dialog_two_parameter_columns_and_full_width_controls(self):
         layer(); dialog=self.dialog();dialog.show();dialog.refresh_diagnostic();QTest.qWait(300)
@@ -1022,7 +1020,7 @@ task.finished(success)
                             for x in range(5,250)))
 
     def test_icon_svg_png_sizes_transparency_color_order(self):
-        svg=ROOT/"LiDAR/lidar_hd_2026/icons/lidar_hd.svg"
+        svg=ROOT/"lidar_hd_2026/icons/lidar_hd.svg"
         xml=ET.parse(svg)
         self.assertEqual(xml.getroot().get("viewBox"),"0 0 64 64")
         renderer=QSvgRenderer(str(svg)); self.assertTrue(renderer.isValid())
@@ -1045,10 +1043,21 @@ task.finished(success)
             if size==128:
                 self.assertEqual(image,QImage(str(svg.with_suffix(".png"))))
 
+    def test_async_entrypoint_preserves_qgis_console_context(self):
+        import runpy
+        target=self.work/"entrypoint"; target.mkdir()
+        shutil.copy2(ROOT/"lidar_ign_async.py",target/"lidar_ign_async.py")
+        (target/"lidar_ign.py").write_text("_LIDAR_IGN_TASK_REFS.append(iface)\n",encoding="utf-8")
+        refs=[]; marker=object()
+        result=runpy.run_path(str(target/"lidar_ign_async.py"),
+                             init_globals={"iface":marker,"_LIDAR_IGN_TASK_REFS":refs})
+        self.assertIs(result["_LIDAR_IGN_TASK_REFS"],refs)
+        self.assertEqual(refs,[marker])
+
     def test_package_reproducible_matches_sources_and_installed_import(self):
-        spec=importlib.util.spec_from_file_location("lidar_builder",ROOT/"LiDAR/build_plugin.py")
+        spec=importlib.util.spec_from_file_location("lidar_builder",ROOT/"build_plugin.py")
         builder=importlib.util.module_from_spec(spec); spec.loader.exec_module(builder)
-        self.assertEqual(builder.DIST,ROOT/"plugin/dist")
+        self.assertEqual(builder.DIST,ROOT/"dist")
         archive=builder.build(self.work)
         content=archive.read_bytes(); self.assertEqual(content,builder.build(self.work).read_bytes())
         with ZipFile(archive) as z:

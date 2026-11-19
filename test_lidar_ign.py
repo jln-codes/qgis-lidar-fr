@@ -1,7 +1,7 @@
 """Tests QGIS 3.44 hors réseau, sur le cache existant (aucun téléchargement).
 
 Exécuter avec le Python de QGIS, depuis la racine du dépôt :
-  QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/test_lidar_ign.py
+  QT_QPA_PLATFORM=offscreen /usr/bin/python3 test_lidar_ign.py
 LIDAR_IGN_CACHE permet de choisir un autre cache local. Sorties temporaires
 sous audits/, supprimées à la fin. Les mesures sont imprimées en JSON.
 """
@@ -32,10 +32,10 @@ from qgis.gui import QgsMapCanvas
 from qgis.PyQt import sip
 from qgis.PyQt.QtCore import QEventLoop, QTimer
 
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / 'LiDAR/lidar_ign.py'
+ROOT = Path(__file__).resolve().parent
+SCRIPT = ROOT / 'lidar_ign.py'
 CACHE = Path(os.environ.get('LIDAR_IGN_CACHE', Path.home() / 'qgis_lidar_ign_cache'))
-EMPRISE = ROOT / 'LiDAR/emprise.gpkg'
+EMPRISE = ROOT / 'emprise.gpkg'
 APP = QgsApplication.instance() or QgsApplication([], True)
 APP.initQgis()
 gdal.UseExceptions()
@@ -127,7 +127,10 @@ class LidarSymbology(unittest.TestCase):
         cls.work = Path(cls.temp.name)
         cls.emprise = QgsVectorLayer(str(EMPRISE) + '|layername=emprise', 'emprise', 'ogr')
         assert cls.emprise.isValid()
-        cls.api['CACHE_DIR'] = CACHE
+        # Read tile inputs only; VRTs and diagnostic logs belong to the temporary test folder.
+        original_path = cls.api['output_path']
+        cls.api['CACHE_DIR'] = cls.work
+        cls.api['output_path'] = lambda x, y: CACHE / 'tiles' / original_path(x, y).name
         expected = cls.api['grid_blocks_intersecting'](cls.api['get_polygons_l93'](cls.emprise))
         available = [xy for xy in expected if cls.api['check_geotiff'](cls.api['output_path'](*xy))]
         cls.tiles = sorted((CACHE / 'tiles').glob('mnt_l93_*_256m_512px.tif'))
@@ -328,6 +331,7 @@ class LidarSymbology(unittest.TestCase):
         # Emprise et sources ne sont jamais écrites : seuls les VRT sont créés
         # dans audits/. Le chemin des tuiles continue à viser le cache réel.
         cache_output_path = self.api['output_path']
+        previous_cache = self.api['CACHE_DIR']
         canvas = QgsMapCanvas()
         active = []
 
@@ -340,27 +344,44 @@ class LidarSymbology(unittest.TestCase):
                 canvas.setExtent(active[0].extent())
             def mapCanvas(self):
                 return canvas
+            def messageBar(self):
+                return type("Messages", (), {"pushMessage": lambda *args, **kwargs: None})()
 
         self.api.update(CACHE_DIR=self.work, iface=Iface(), output_path=lambda x, y: CACHE / 'tiles' / cache_output_path(x, y).name)
+        def complete_main():
+            # main() schedules QgsTask; only its GUI callback adds and styles the raster.
+            self.api['main']()
+            pending = list(self.api['_LIDAR_IGN_TASK_REFS'])
+            deadline = time.monotonic() + 90
+            while self.api['_LIDAR_IGN_TASK_REFS'] and time.monotonic() < deadline:
+                APP.processEvents()
+                time.sleep(0.01)
+            self.assertFalse(self.api['_LIDAR_IGN_TASK_REFS'], 'Tâche LiDAR non terminée')
+            self.assertTrue(pending, 'Aucune tâche créée')
+            for task in pending:
+                self.assertFalse(task.error, task.error)
+                self.assertFalse(task.isCanceled())
+            APP.processEvents()
+
         try:
             with patch.dict(self.api, download_block=unittest.mock.Mock(side_effect=AssertionError('Téléchargement interdit'))):
                 with contextlib.redirect_stdout(io.StringIO()):
                     if self.coverage['available'] == self.coverage['expected']:
-                        self.api['main']()
+                        complete_main()
                         self.assert_renderer(active[0].renderer())
                         real_vrt = gdal.Open(active[0].source())
                         self.assertEqual(len(real_vrt.GetFileList()) - 1, self.coverage['expected'])
                         real_vrt = None
                         project.removeMapLayer(self.emprise.id())
                     project.addMapLayer(layer)
-                    self.api['main']()
+                    complete_main()
                     first_source = active[0].source()
                     self.assert_renderer(active[0].renderer())
-                    self.api['main']()
+                    complete_main()
                     self.assertEqual(active[0].source(), first_source)
                     # Une sélection spatiale différente doit changer le VRT.
                     layer.selectByIds([next(layer.getFeatures()).id()])
-                    self.api['main']()
+                    complete_main()
                     self.assertNotEqual(active[0].source(), first_source)
                 self.api['download_block'].assert_not_called()
             # Vérifier aussi Polygon (les deux géométries sont acceptées).
@@ -373,7 +394,7 @@ class LidarSymbology(unittest.TestCase):
             project.addMapLayer(polygon)
             with patch.dict(self.api, download_block=unittest.mock.Mock(side_effect=AssertionError('Téléchargement interdit'))):
                 with contextlib.redirect_stdout(io.StringIO()):
-                    self.api['main']()
+                    complete_main()
                 self.api['download_block'].assert_not_called()
             outputs = [l for l in project.mapLayers().values() if isinstance(l, QgsRasterLayer)]
             self.assertEqual(len(outputs), 1)
@@ -384,7 +405,7 @@ class LidarSymbology(unittest.TestCase):
             canvas.close()
             sip.delete(canvas)
             project.clear()
-            self.api['CACHE_DIR'] = CACHE
+            self.api['CACHE_DIR'] = previous_cache
             self.api['output_path'] = cache_output_path
 
 

@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/dist/
+/audits/
+*.log
+.env
+.env.*
+*.local.txt
+MISTRAL_API_KEY.txt

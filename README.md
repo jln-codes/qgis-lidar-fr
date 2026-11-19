@@ -9,7 +9,7 @@ ni importé ni inclus dans le ZIP.
 ## Installation et utilisation
 
 1. Dans QGIS, ouvrir **Extensions → Installer/Gérer les extensions → Installer
-   depuis un ZIP** et choisir `plugin/dist/lidar_hd_2026-0.1.3.zip` dans le dépôt.
+   depuis un ZIP** et choisir `dist/lidar_hd_2026-0.1.3.zip` dans le dépôt.
 2. Activer **LiDAR HD 2026**. Son unique bouton se trouve dans la barre
    **SIG-Milieux**. Si nécessaire, afficher cette barre via
    **Vue → Barres d'outils**. Le gestionnaire d'extensions reste accessible normalement.
@@ -155,9 +155,9 @@ incomplets ; actualiser le global ne restaure pas les fichiers supprimés.
 
 Les deux plugins recherchent la même barre Qt `SIGMilieuxToolbar`, titrée
 **SIG-Milieux**, sans importer le code de l'autre. Chaque plugin retire seulement
-ses propres actions ; le dernier retire la barre vide. Le ZIP SIG-Prestations
-reconstruit avec cette adaptation graphique est aussi disponible sous `plugin/dist/`.
-Son icône et ses fonctionnalités métier ne changent pas.
+ses propres actions ; le dernier retire la barre vide. GEMAPI-App est distribué séparément :
+[github.com/jln-codes/gemapi-app](https://github.com/jln-codes/gemapi-app).
+Aucun code, constructeur, clone ou ZIP de cet autre dépôt n’est requis ici.
 
 L'icône LiDAR reprend la référence fournie
 `a_clean_flat_vector_style_icon_on_a_white_backgr.png` : cercle marine, scanner,
@@ -166,33 +166,27 @@ vectoriel natif, sans PNG incorporé, police ni ressource externe. L'intérieur 
 cercle reste blanc ; l'extérieur est transparent. `icons/lidar_hd.png` est son
 export 128 × 128. Le SVG est utilisé dans l'action et les métadonnées. Les
 aperçus 16, 24, 32 et 128 pixels sur fonds clair/sombre sont générés dans
-`audits/lidar-icons/`. La pastille précédente y reste consultable pour examen
-visuel, sans entrer dans le ZIP.
+`audits/lidar-icons/`. Les aperçus restent locaux et n’entrent pas dans le ZIP.
 
 ## Construction et tests reproductibles
 
 Depuis la racine du dépôt :
 
-Les ZIP sont des sorties locales générées dans `plugin/dist/` et ignorées par
+Le ZIP est une sortie locale générée dans `dist/` et ignorée par
 Git. Les commandes ci-dessous permettent de les reconstruire après un clone.
 
 ```sh
-python3 LiDAR/build_plugin.py
-# Construire aussi le ZIP SIG-Prestations courant dans plugin/dist/ :
-python3 LiDAR/build_plugin.py --with-sig
+python3 build_plugin.py
 # Régénérer PNG et aperçus avec le Python fourni avec QGIS :
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/build_plugin.py --icons
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 build_plugin.py --icons
 # Tests PyQGIS/GDAL, données synthétiques, réseau Python interdit :
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s LiDAR/tests -v
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest discover -s tests -v
 # Mesures locales reproductibles, 100 tuiles synthétiques, résultats sous audits/ :
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 LiDAR/tests/benchmark_library.py
-# Régression de l'intégration graphique SIG-Prestations :
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 -m unittest plugin.tests.test_package -v
-QT_QPA_PLATFORM=offscreen /usr/bin/python3 plugin/tests/test_qgis_runtime.py
+QT_QPA_PLATFORM=offscreen /usr/bin/python3 tests/benchmark_library.py
 ```
 
-Sous Windows, exécuter `python LiDAR/build_plugin.py --icons` et
-`python -m unittest discover -s LiDAR/tests -v` dans l'environnement Python/QGIS
+Sous Windows, exécuter `python build_plugin.py --icons` et
+`python -m unittest discover -s tests -v` dans l'environnement Python/QGIS
 fourni par l'installation QGIS. Le test configure `offscreen` par défaut.
 Ne pas lancer avec un Python sans PyQGIS. Les sorties temporaires sont placées
 sous `audits/` et nettoyées automatiquement. Le constructeur contrôle le manifeste
@@ -201,26 +195,43 @@ horodatages ZIP sont fixes pour rendre l'archive reproductible.
 
 `tests/desktop_smoke.py` est une recette automatisée distincte, lancée dans
 **QGIS Desktop réel**, avec les ZIP extraits dans un profil de test, des clics Qt
-et des GeoTIFF fictifs. Sous Linux, après avoir construit les deux ZIP dans
-`plugin/dist/`, on peut la lancer dans un affichage virtuel :
+et des GeoTIFF fictifs. Sous Linux, après avoir construit le ZIP LiDAR dans
+`dist/`, on peut la lancer dans un affichage virtuel :
 
 ```sh
 LIDAR_PROJECT_ROOT="$PWD" QT_QPA_PLATFORM=xcb QT_XCB_GL_INTEGRATION=none \
 QT_OPENGL=software LIBGL_ALWAYS_SOFTWARE=1 xvfb-run -a qgis \
-  --nologo --noversioncheck \
+  --nologo --noversioncheck --noplugins \
   --profiles-path "$PWD/audits/lidar-desktop/profiles" --profile lidar-smoke \
-  --code "$PWD/LiDAR/tests/desktop_smoke.py"
+  --code "$PWD/tests/desktop_smoke.py"
 ```
 
-Cette recette utilise un profil isolé, sans extensions utilisateur ; conserver
-l'extension intégrée **Processing** active, nécessaire à l'exécution de `--code`.
+Cette recette utilise un profil isolé, sans extensions utilisateur.
 Elle est distincte d'une recette humaine. Son résultat est écrit dans
 `audits/lidar-desktop/result.json`. Les tests avec des façades d'énumérations
-3.34 et 3.40 sont **simulés**, pas des exécutions sur ces versions. Consulter
-`audits/LIDAR-PLUGIN-04.md` pour le stockage mutualisé et le VRT global,
-`audits/LIDAR-PLUGIN-03.md` pour la finalisation du dialogue et
-`audits/LIDAR-PLUGIN-02.md` pour les résultats effectifs de la correction IGN,
-de la barre et du dialogue ; `audits/LIDAR-PLUGIN-01.md` décrit
-l'inventaire des API. La validation Windows et les recettes interactives dans
-QGIS Desktop 3.34/3.40 restent à réaliser ; les tests PyQGIS hors écran ont été
-exécutés réellement sur ces versions sous Linux.
+3.34 et 3.40 sont **simulés**, pas des exécutions sur ces versions. Consulter [LIDAR-EXTRACT-01.md](LIDAR-EXTRACT-01.md) pour l’extraction Git,
+les tests actuels et les limites de validation. Les audits antérieurs sont conservés
+dans l’historique du dépôt GEMAPI-App. La validation Windows et les recettes
+interactives QGIS Desktop 3.34/3.40 restent à réaliser.
+
+## Dépôt autonome et scripts
+
+Cloner `https://github.com/jln-codes/qgis-lidar-fr.git`, puis lancer les commandes
+ci-dessus depuis sa racine. `lidar_hd_2026/`, `tests/` et `build_plugin.py` sont
+au même niveau. Le constructeur utilise exclusivement les sources de ce dépôt
+et écrit `dist/lidar_hd_2026-0.1.3.zip`.
+
+`lidar_ign.py` est déjà asynchrone. `lidar_ign_async.py` est une entrée vers ce
+même script courant ; il n’existe pas de second moteur. Dans l’éditeur Python
+QGIS, ouvrir puis exécuter le fichier. Le contexte `iface` et les références des
+tâches sont conservés. Les deux scripts restent hors du ZIP du plugin.
+
+Les tests de barre utilisent une action Qt indépendante ; ils ne nécessitent
+pas GEMAPI-App. Pour la recette avec les deux extensions, installer les deux ZIP
+séparément et suivre les permutations de [LIDAR-EXTRACT-01.md](LIDAR-EXTRACT-01.md).
+
+Le test facultatif du script de référence se lance avec
+`QT_QPA_PLATFORM=offscreen /usr/bin/python3 test_lidar_ign.py` ; il requiert un
+cache local existant (`LIDAR_IGN_CACHE` permet de le sélectionner) et interdit
+le réseau. Il vérifie que les tuiles et GeoPackages restent inchangés. Ses VRT
+et diagnostics restent dans un dossier temporaire sous `audits/`.

@@ -1,4 +1,4 @@
-"""Recette automatisée dans QGIS Desktop réel, via --code (voir LiDAR/README.md).
+"""Recette automatisée dans QGIS Desktop réel, via --code (voir README.md).
 
 Ce fichier est chargé par QgisApp, pas par unittest. Aucun appel IGN autorisé.
 Sources installées depuis les ZIP ; clics Qt réels ; sorties dans audits/.
@@ -95,56 +95,34 @@ def assert_no_lidar_menu():
 def start():
     record("installation ZIP")
     installed = WORK_PATH / "plugins"; installed.mkdir()
-    archives = []
-    for name, folder in (("lidar_hd_2026", "LiDAR"), ("sig_prestations", "plugin")):
-        metadata = configparser.ConfigParser(interpolation=None)
-        metadata.read(ROOT / folder / name / "metadata.txt", encoding="utf-8")
-        default=ROOT / f"plugin/dist/{name}-{metadata['general']['version']}.zip"
-        override="LIDAR_SMOKE_SIG_ZIP" if name=="sig_prestations" else "LIDAR_SMOKE_LIDAR_ZIP"
-        archives.append(Path(os.environ.get(override,str(default))))
-    for archive in archives:
-        with ZipFile(archive) as z:
-            z.extractall(installed)
+    metadata = configparser.ConfigParser(interpolation=None)
+    metadata.read(ROOT / "lidar_hd_2026/metadata.txt", encoding="utf-8")
+    default = ROOT / f"dist/lidar_hd_2026-{metadata['general']['version']}.zip"
+    archive = Path(os.environ.get("LIDAR_SMOKE_LIDAR_ZIP", str(default)))
+    with ZipFile(archive) as z:
+        z.extractall(installed)
     sys.path.insert(0, str(installed))
     from lidar_hd_2026 import classFactory as lidar_factory
-    from sig_prestations import classFactory as sig_factory
-    import lidar_hd_2026, sig_prestations
-    RESULT["installed_packages"] = {}
-    for name, package in (("lidar_hd_2026",lidar_hd_2026),("sig_prestations",sig_prestations)):
-        metadata=configparser.ConfigParser(interpolation=None)
-        metadata.read(Path(package.__file__).with_name("metadata.txt"),encoding="utf-8")
-        RESULT["installed_packages"][name]={"version":metadata["general"]["version"],"path":package.__file__}
-    lidar = lidar_factory(iface); sig = sig_factory(iface)
-    PLUGINS.extend([sig, lidar])
-    sig.initGui(); lidar.initGui(); lidar.initGui()
+    import lidar_hd_2026
+    assert Path(lidar_hd_2026.__file__).resolve().parent == installed / "lidar_hd_2026"
+    RESULT["installed_packages"] = {"lidar_hd_2026": {"version": metadata["general"]["version"],
+                                                    "path": lidar_hd_2026.__file__}}
+    lidar = lidar_factory(iface); PLUGINS.append(lidar)
+    lidar.initGui(); lidar.initGui()
     assert_no_lidar_menu()
     toolbar = iface.mainWindow().findChild(QToolBar, "SIGMilieuxToolbar")
-    iface.mainWindow().resize(1280, 900)
-    QTest.qWait(100)
-    RESULT["toolbar_geometry"] = [toolbar.width(),toolbar.height()]
-    RESULT["toolbar_buttons"] = [{"visible":toolbar.widgetForAction(a).isVisible(),
-                                 "style":int(toolbar.widgetForAction(a).toolButtonStyle()),
-                                 "text":a.text()} for a in toolbar.actions()]
-    record("vérification de la barre")
-    assert len(toolbar.actions()) == 2
-    assert toolbar.isVisible()
-    assert toolbar.toolButtonStyle() == Qt.ToolButtonIconOnly
-    assert all(toolbar.widgetForAction(a).isVisible() and
-               toolbar.widgetForAction(a).toolButtonStyle()==Qt.ToolButtonIconOnly for a in toolbar.actions())
+    assert toolbar is lidar.toolbar and toolbar.actions() == [lidar.action]
+    assert len(iface.mainWindow().findChildren(QToolBar, "SIGMilieuxToolbar")) == 1
+    assert toolbar.isVisible() and toolbar.toolButtonStyle() == Qt.ToolButtonIconOnly
     toolbar.hide(); toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-    sig.unload(); assert len(toolbar.actions()) == 1
-    PLUGINS.remove(sig)
-    sig = sig_factory(iface); sig.initGui(); PLUGINS.insert(0, sig)
-    assert len(toolbar.actions()) == 2
-    assert toolbar.isVisible() and toolbar.toolButtonStyle()==Qt.ToolButtonIconOnly
+    lidar.unload(); PLUGINS.clear()
+    assert iface.mainWindow().findChild(QToolBar, "SIGMilieuxToolbar") is None
+    lidar = lidar_factory(iface); lidar.initGui(); PLUGINS.append(lidar)
+    toolbar = lidar.toolbar
+    assert toolbar.isVisible() and toolbar.actions() == [lidar.action]
+    assert_no_lidar_menu()
     RESULT["toolbar_load_unload"] = True
-    lidar.unload(); PLUGINS.remove(lidar)
-    assert_no_lidar_menu()
-    lidar=lidar_factory(iface); lidar.initGui(); PLUGINS.append(lidar)
-    assert_no_lidar_menu()
-    assert len(toolbar.actions()) == 2
-    RESULT["extensions_menu_absent_after_reload"] = True
-    record("barre commune validée")
+    record("barre autonome validée")
     layers = create_inputs()
     iface.mainWindow().resize(1280, 900)
     toolbar.grab().save(str(OUTPUT/"toolbar.png"))
